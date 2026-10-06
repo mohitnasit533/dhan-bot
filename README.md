@@ -1,4 +1,6 @@
-# Dhan Intraday Desk
+# dhan-bot
+
+Auto trade stock options with multi confirmation and auto scanner.
 
 A local dashboard for scanning stock-option setups through DhanHQ. The scanner uses closed 15-minute candles and the configured stock symbols in `dhan.js`.
 
