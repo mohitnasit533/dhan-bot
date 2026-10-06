@@ -1,0 +1,16 @@
+{
+  "name": "dhan-local-dashboard",
+  "version": "1.0.0",
+  "description": "Local Dhan trading dashboard with scanner and auto-trade workspace",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "csv-parse": "^7.0.3",
+    "express": "^4.19.2",
+    "express-rate-limit": "^8.7.1",
+    "helmet": "^8.3.0"
+  }
+}
