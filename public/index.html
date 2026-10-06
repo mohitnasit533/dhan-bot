@@ -201,13 +201,13 @@
             </div>
             <button id="save-settings" type="submit">Save settings</button>
           </form>
-          <p class="note">Fixed option-premium stop loss: 20%. Target: 50%. Stock options only; maximum five open trades. Entries: weekdays 09:15 to before 14:00 IST. Dhan requires a whitelisted static IP for live orders.</p>
+          <p class="note">Fixed option-premium stop loss: 20%. Target: 50%. Stock options only; maximum five open trades. Entries: weekdays 09:45 to before 14:00 IST. Dhan requires a whitelisted static IP for live orders.</p>
         </section>
 
         <section class="card">
           <div class="card-head"><h2>Strategy rules</h2><span class="pill">15-minute closed candles</span></div>
           <p class="note" style="margin-top:0">All conditions must confirm: EMA 21/34 crossover, Supertrend direction, close on the correct side of VWAP, and a narrow CPR breakout (CPR width ≤ 0.5% of the prior close).</p>
-          <p class="note">BUY signal → sell PE near −0.40 delta. SELL signal → sell CE near +0.40 delta. If the nearest stock-option expiry is within seven days, use the next calendar-month expiry.</p>
+          <p class="note">BUY signal → sell PE near −0.40 delta. SELL signal → sell CE near +0.40 delta. Use the current monthly stock-option expiry; switch to next month's monthly expiry during the final seven calendar days before expiry.</p>
         </section>
       </aside>
 
