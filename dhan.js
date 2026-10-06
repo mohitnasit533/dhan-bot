@@ -198,7 +198,8 @@ async function getOptionData(underlying, signal) {
 
 async function createOptionOrderPreview({ symbol, signal, lots, includeMargin = true }) {
   requireConnection();
-  if (!SCAN_SYMBOLS.includes(symbol) || !['BUY', 'SELL'].includes(signal)) {
+  const supportedSymbols = new Set((await getEquityInstruments()).map((instrument) => instrument.symbol));
+  if (!supportedSymbols.has(symbol) || !['BUY', 'SELL'].includes(signal)) {
     throw new Error('Choose a supported symbol with a confirmed BUY or SELL signal.');
   }
   const stopLossPct = 20;
