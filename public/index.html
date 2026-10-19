@@ -17,11 +17,12 @@
       --green: #8de0a5;
       --red: #ff9f9a;
       --amber: #f5ce79;
+      --cyan: #88d7e8;
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
-      background: radial-gradient(ellipse at 80% -10%, #244230 0, transparent 38%), var(--bg);
+      background: radial-gradient(ellipse at 82% -12%, #2a553b 0, transparent 38%), radial-gradient(ellipse at 0 35%, #152d32 0, transparent 30%), var(--bg);
       color: var(--text);
       font: 14px/1.5 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
@@ -34,7 +35,8 @@
       color: var(--text);
       cursor: pointer;
     }
-    button:hover:not(:disabled) { border-color: var(--green); }
+    button { transition: transform .18s ease, border-color .18s ease, box-shadow .18s ease, background .18s ease; }
+    button:hover:not(:disabled) { border-color: var(--green); transform: translateY(-1px); box-shadow: 0 6px 22px #0004; }
     button:disabled { cursor: not-allowed; opacity: .45; }
     button.primary { background: #27623b; border-color: #397c4e; }
     button.danger { color: var(--red); }
@@ -80,14 +82,15 @@
     h2 { font-size: 16px; }
     .subtitle, .muted { color: var(--muted); }
     .brand { display: flex; align-items: center; gap: 12px; }
-    .logo { display: grid; width: 42px; height: 42px; place-items: center; border-radius: 12px; background: #254d32; color: var(--green); font-weight: 800; }
+    .logo { display: grid; width: 42px; height: 42px; place-items: center; border-radius: 12px; background: linear-gradient(145deg, #377e4e, #1b3828); color: var(--green); font-weight: 800; box-shadow: 0 0 28px #6fda8b22; }
     .header-actions, .inline { display: flex; align-items: center; gap: 10px; }
     .status { display: inline-flex; align-items: center; gap: 8px; padding: 7px 10px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); }
     .dot { width: 8px; height: 8px; border-radius: 50%; background: #77857b; }
-    .status.connected .dot { background: var(--green); box-shadow: 0 0 10px #8de0a555; }
+    .status.connected .dot { background: var(--green); box-shadow: 0 0 10px #8de0a555; animation: breathe 2s infinite; }
     .grid { display: grid; grid-template-columns: minmax(300px, 360px) minmax(0, 1fr); gap: 18px; align-items: start; }
     .stack { display: grid; gap: 18px; }
-    .card { border: 1px solid var(--line); border-radius: 14px; background: #171f1beF; padding: 18px; box-shadow: 0 14px 45px #00000012; }
+    .card { border: 1px solid #34443a; border-radius: 16px; background: linear-gradient(145deg, #1b2620f5, #151c19f5); padding: 18px; box-shadow: 0 18px 50px #0003; transition: border-color .2s ease, transform .2s ease, box-shadow .2s ease; animation: rise-in .45s both; }
+    .card:hover { border-color: #506b58; box-shadow: 0 22px 56px #0004; }
     .card-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 15px; }
     .form-grid { display: grid; gap: 12px; }
     .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
@@ -97,7 +100,8 @@
     .notice.error { border-color: #804743; color: var(--red); }
     .notice.success { border-color: #397c4e; color: var(--green); }
     .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 14px; }
-    .stat { padding: 12px; border-radius: 10px; background: var(--surface-raised); }
+    .stat { padding: 12px; border: 1px solid #34443a; border-radius: 12px; background: linear-gradient(145deg, #202e26, #18211c); transition: border-color .2s ease, transform .2s ease; }
+    .stat:hover { border-color: #5b8a68; transform: translateY(-2px); }
     .stat span { display: block; color: var(--muted); font-size: 11px; }
     .stat strong { display: block; margin-top: 3px; font-size: 16px; }
     .table-wrap { overflow-x: auto; }
@@ -120,6 +124,22 @@
     .preview-item span { display: block; color: var(--muted); font-size: 11px; }
     .preview-item strong { display: block; overflow-wrap: anywhere; }
     .warning { color: var(--amber); margin: 10px 0 14px; font-size: 12px; }
+    .scan-meta { display: grid; justify-items: end; gap: 5px; text-align: right; }
+    .scan-indicator { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); font-size: 11px; }
+    .scan-indicator i { width: 7px; height: 7px; border-radius: 50%; background: #748078; }
+    .scan-indicator.on { color: var(--green); }
+    .scan-indicator.on i { background: var(--green); box-shadow: 0 0 10px #8de0a5aa; animation: breathe 1.2s infinite; }
+    .scan-indicator.busy i { background: var(--cyan); box-shadow: 0 0 12px #88d7e8; }
+    .scanner-card { position: relative; overflow: hidden; }
+    .scanner-card::before { content: ""; position: absolute; inset: 0 auto auto 0; height: 2px; width: 100%; background: linear-gradient(90deg, transparent, var(--green), var(--cyan), transparent); opacity: .55; }
+    .scanner-card.scanning::before { background-size: 200% 100%; animation: scan-line 1s linear infinite; opacity: 1; }
+    .pill.buy { box-shadow: 0 0 14px #56cc7b1c; }
+    tbody tr { transition: background .16s ease; }
+    tbody tr:hover { background: #ffffff08; }
+    #scanner-filter { max-width: 280px; }
+    @keyframes breathe { 50% { opacity: .45; } }
+    @keyframes rise-in { from { opacity: 0; transform: translateY(7px); } to { opacity: 1; transform: translateY(0); } }
+    @keyframes scan-line { to { background-position: -200% 0; } }
     .footer { margin: 20px 0 4px; color: var(--muted); font-size: 11px; text-align: center; }
     @media (max-width: 900px) {
       .shell { padding: 18px; }
@@ -134,7 +154,10 @@
       .stats { grid-template-columns: 1fr; }
       .two-col { grid-template-columns: 1fr 1fr; }
       .card { padding: 14px; }
+      .card-head { align-items: flex-start; flex-wrap: wrap; }
+      .scan-meta { justify-items: start; text-align: left; }
     }
+    @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; transition-duration: .01ms !important; } }
   </style>
 </head>
 <body>
@@ -196,33 +219,33 @@
                   <input name="autoTrade" type="checkbox" role="switch">
                   <span>Auto trade</span>
                 </label>
-                <p class="note">Off = manual preview and confirmation. On = confirmed signals open Paper trades automatically; Live always requires confirmation.</p>
+                <p class="note">Off = manual preview and confirmation. On = Paper simulates signals; in Live mode, new confirmed signals place real stock-option orders automatically after a broker position and active-order check.</p>
               </div>
             </div>
             <button id="save-settings" type="submit">Save settings</button>
           </form>
-          <p class="note">Fixed option-premium stop loss: 20%. Target: 50%. Stock options only; maximum five open trades. Entries: weekdays 09:45 to before 14:00 IST. Dhan requires a whitelisted static IP for live orders.</p>
+          <p class="note">Fixed option-premium stop loss: 20%. Target: 50%. Current NSE stock F&amp;O universe; maximum five open trades. Entries: weekdays 09:45 to before 14:00 IST. Dhan requires a whitelisted static IP for live orders.</p>
         </section>
 
         <section class="card">
           <div class="card-head"><h2>Strategy rules</h2><span class="pill">15-minute closed candles</span></div>
           <p class="note" style="margin-top:0">All conditions must confirm: EMA 21/34 crossover, Supertrend direction, close on the correct side of VWAP, and a narrow CPR breakout (CPR width ≤ 0.5% of the prior close).</p>
-          <p class="note">BUY signal → sell PE near −0.40 delta. SELL signal → sell CE near +0.40 delta. Use the current monthly stock-option expiry; switch to next month's monthly expiry during the final seven calendar days before expiry.</p>
-          <p class="note">Scanner universe: all NSE stock-option underlyings. Stocks must have at least ₹5 crore traded value today; qualifying names are ranked by turnover and scanned.</p>
+          <p class="note">BUY signal → sell PE near −0.40 delta. SELL signal → sell CE near +0.40 delta. Use the monthly stock-option expiry through its final seven calendar days, then shift to the next month’s chain.</p>
         </section>
       </aside>
 
       <div class="stack">
-        <section class="card">
+        <section class="card scanner-card" id="scanner-card">
           <div class="card-head">
             <div><h2>Market scanner</h2><p id="scanner-caption" class="note">Connect your account to load market data.</p></div>
-            <span id="updated-at" class="muted"></span>
+            <div class="scan-meta"><span id="scan-indicator" class="scan-indicator"><i></i><span>Auto scan on</span></span><span id="updated-at" class="muted"></span></div>
           </div>
           <div class="stats">
             <div class="stat"><span>BUY signals</span><strong id="buy-count">—</strong></div>
             <div class="stat"><span>SELL signals</span><strong id="sell-count">—</strong></div>
             <div class="stat"><span>Active positions</span><strong id="position-count">0 / 5</strong></div>
           </div>
+          <label class="note" for="scanner-filter">Filter F&amp;O stocks <input id="scanner-filter" type="search" placeholder="Search symbol" autocomplete="off"></label>
           <div class="table-wrap">
             <table>
               <thead><tr><th>Stock</th><th>Turnover (₹ Cr)</th><th>Price</th><th>EMA 21 / 34</th><th>VWAP</th><th>CPR</th><th>Trend</th><th>Signal</th><th>Setup</th><th>Action</th></tr></thead>

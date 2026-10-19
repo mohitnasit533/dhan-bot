@@ -6,10 +6,21 @@ let activePreviewId = null;
 let currentMode = 'PAPER';
 let connected = false;
 let scannerRefreshInFlight = false;
+let autoTradeEnabled = false;
+let latestScannerResults = [];
+let scannerRenderSignature = '';
 
 function showNotice(message, kind = '') {
   notice.textContent = message || '';
   notice.className = message ? `notice show ${kind}` : 'notice';
+}
+
+function updateScanIndicator(busy = false) {
+  const indicator = $('#scan-indicator');
+  const enabled = Boolean($('#scan-auto-refresh')?.checked);
+  indicator.classList.toggle('on', enabled && connected);
+  indicator.classList.toggle('busy', busy);
+  indicator.querySelector('span').textContent = busy ? 'Updating…' : enabled ? 'Auto scan on' : 'Auto scan off';
 }
 
 async function api(path, options = {}) {
@@ -58,19 +69,31 @@ async function refreshConnection() {
   const form = $('#trade-settings');
   form.elements.lots.value = settings.lotSize ?? 1;
   form.elements.maxTrades.value = settings.maxTrades ?? 5;
+  autoTradeEnabled = Boolean(connection.autoTrade);
   form.elements.autoTrade.checked = Boolean(connection.autoTrade);
   $('#trade-mode-label').textContent = connection.autoTrade ? 'Auto trade' : 'Manual confirmation';
 }
 
 function renderScanner(results = []) {
+  latestScannerResults = results;
+  for (const row of results) {
+    if (row.dataError) row.setup = row.dataError;
+  }
   $('#buy-count').textContent = String(results.filter((row) => row.signal === 'BUY').length);
   $('#sell-count').textContent = String(results.filter((row) => row.signal === 'SELL').length);
   const body = $('#scanner-body');
-  if (!results.length) {
-    body.innerHTML = `<tr><td colspan="10" class="empty">${connected ? 'No NSE F&O stocks reached ₹5 crore turnover today yet.' : 'Connect Dhan to see scanner results.'}</td></tr>`;
+  const search = ($('#scanner-filter')?.value || '').trim().toUpperCase();
+  const visibleResults = search ? results.filter((row) => row.symbol.includes(search)) : results;
+  if (!visibleResults.length) {
+    scannerRenderSignature = '';
+    body.innerHTML = `<tr><td colspan="9" class="empty">${connected ? 'No scanner data returned.' : 'Connect Dhan to see scanner results.'}</td></tr>`;
     return;
   }
-  body.innerHTML = results.map((row) => {
+  const signature = JSON.stringify(visibleResults.map((row) => [
+    row.symbol, row.ema21, row.ema34, row.vwap, row.cpr, row.trend, row.signal, row.setup, row.dataError
+  ]));
+  if (signature !== scannerRenderSignature) {
+    body.innerHTML = visibleResults.map((row) => {
     const signal = row.signal || 'WATCH';
     const badgeClass = signal === 'BUY' ? 'buy' : signal === 'SELL' ? 'sell' : 'watch';
     const cpr = row.cpr
@@ -79,7 +102,7 @@ function renderScanner(results = []) {
     const action = ['BUY', 'SELL'].includes(signal)
       ? `<button class="small-button primary preview-button" data-symbol="${escapeHtml(row.symbol)}" data-signal="${escapeHtml(signal)}" type="button">Preview</button>`
       : '<span class="muted">—</span>';
-    return `<tr>
+    return `<tr data-symbol="${escapeHtml(row.symbol)}">
       <td><strong>${escapeHtml(row.symbol)}</strong></td>
       <td>${Number.isFinite(Number(row.turnover)) ? (Number(row.turnover) / 10000000).toFixed(1) : '—'}</td>
       <td>${formatPrice(row.price)}</td>
@@ -91,7 +114,17 @@ function renderScanner(results = []) {
       <td>${escapeHtml(row.setup || '—')}</td>
       <td>${action}</td>
     </tr>`;
-  }).join('');
+    }).join('');
+    scannerRenderSignature = signature;
+  }
+  const rowsBySymbol = new Map(Array.from(body.querySelectorAll('tr[data-symbol]'))
+    .map((row) => [row.dataset.symbol, row]));
+  for (const row of visibleResults) {
+    const rendered = rowsBySymbol.get(row.symbol);
+    if (rendered && rendered.cells[1].textContent !== formatPrice(row.price)) {
+      rendered.cells[1].textContent = formatPrice(row.price);
+    }
+  }
 }
 
 function renderPositions(positions = []) {
@@ -122,6 +155,8 @@ function renderPositions(positions = []) {
 async function refreshScanner(showErrors = true) {
   if (scannerRefreshInFlight) return;
   scannerRefreshInFlight = true;
+  $('#scanner-card').classList.add('scanning');
+  updateScanIndicator(true);
   $('#refresh-button').disabled = true;
   try {
     const data = await api('/api/scanner');
@@ -131,7 +166,8 @@ async function refreshScanner(showErrors = true) {
     $('#scanner-caption').textContent = data.connected
       ? `${data.strategy || 'Live market data'} · ${data.mode || currentMode} mode`
       : (data.message || 'Connect your account to load market data.');
-    $('#updated-at').textContent = `Updated ${new Date().toLocaleTimeString()}`;
+    const quoteTime = data.quotesUpdatedAt ? new Date(data.quotesUpdatedAt) : new Date();
+    $('#updated-at').textContent = `Cash prices ${quoteTime.toLocaleTimeString()} · ${data.results?.length || 0} stocks`;
     if (data.autoTrade?.lastError) showNotice(`Auto-trade: ${data.autoTrade.lastError}`, 'error');
     return data;
   } catch (error) {
@@ -139,6 +175,8 @@ async function refreshScanner(showErrors = true) {
     throw error;
   } finally {
     scannerRefreshInFlight = false;
+    $('#scanner-card').classList.remove('scanning');
+    updateScanIndicator(false);
     $('#refresh-button').disabled = false;
   }
 }
@@ -183,7 +221,7 @@ $('#disconnect-button').addEventListener('click', async () => {
 
 $('#mode-select').addEventListener('change', async (event) => {
   const requestedMode = event.target.value;
-  if (requestedMode === 'LIVE' && !confirm('Enable LIVE mode? This allows confirmed orders to be submitted to Dhan.')) {
+  if (requestedMode === 'LIVE' && !confirm('Enable LIVE mode? Manual orders can be submitted after confirmation. If Auto trade is enabled, the server may place real orders without a per-order confirmation.')) {
     event.target.value = currentMode;
     return;
   }
@@ -209,8 +247,14 @@ $('#trade-settings').addEventListener('submit', async (event) => {
     lotSize: Number(values.lots),
     maxTrades: Number(values.maxTrades)
   };
+  if (payload.enabled && currentMode === 'LIVE'
+    && !confirm('Enable automatic LIVE trading? The server will place real stock-option orders when a new confirmed signal appears, without asking again for each order.')) {
+    event.currentTarget.elements.autoTrade.checked = autoTradeEnabled;
+    return;
+  }
   try {
     const data = await api('/api/auto-trade', { method: 'POST', body: JSON.stringify(payload) });
+    autoTradeEnabled = data.enabled;
     $('#trade-mode-label').textContent = data.enabled ? 'Auto trade' : 'Manual confirmation';
     if (data.enabled) {
       $('#scan-auto-refresh').checked = true;
@@ -296,6 +340,7 @@ $('#positions-body').addEventListener('click', async (event) => {
 });
 
 $('#refresh-button').addEventListener('click', () => refreshScanner().catch(() => {}));
+$('#scanner-filter').addEventListener('input', () => renderScanner(latestScannerResults));
 $('#cancel-preview').addEventListener('click', () => {
   activePreviewId = null;
   $('#preview-card').classList.add('hidden');
@@ -319,12 +364,14 @@ window.setInterval(() => {
 try {
   $('#scan-auto-refresh').checked = localStorage.getItem('dhan-auto-scan') !== 'false';
 } catch {}
+updateScanIndicator();
 
 $('#scan-auto-refresh').addEventListener('change', (event) => {
   try {
     localStorage.setItem('dhan-auto-scan', String(event.currentTarget.checked));
   } catch {}
   if (event.currentTarget.checked && connected) refreshScanner().catch(() => {});
+  updateScanIndicator();
   showNotice(event.currentTarget.checked
     ? 'Auto scan enabled: scanner refreshes every second, subject to Dhan API rate limits.'
     : 'Auto scan disabled: use Refresh scanner when you want new data.', 'success');

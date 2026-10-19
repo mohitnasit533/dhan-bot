@@ -4,16 +4,21 @@ const { parse } = require('csv-parse/sync');
 
 const API_BASE = 'https://api.dhan.co/v2';
 const SCRIP_MASTER_URL = 'https://images.dhan.co/api-data/api-scrip-master.csv';
-const MIN_DAILY_TURNOVER = 50000000;
+let SCAN_SYMBOLS = [];
+let equityInstrumentsCache = null;
+let candleRefreshPromise = null;
 
 let credentials = null;
 let scripMasterPromise = null;
+let scripMasterFetchedAt = 0;
+let equityInstrumentsCachedAt = 0;
 let quoteCache = { fetchedAt: 0, quotes: null, key: '' };
 let lastCandleRequestAt = 0;
 let lastOptionChainAt = 0;
 let lastQuoteRequestAt = 0;
 let quoteQueue = Promise.resolve();
 const candleCache = new Map();
+const indicatorCache = new Map();
 
 function safeErrorMessage(payload, fallback) {
   return payload?.errorMessage || payload?.remarks?.error_message || payload?.message || fallback;
@@ -66,6 +71,9 @@ async function connect(clientId, accessToken) {
 
   credentials = { clientId: normalizedClientId, accessToken: normalizedToken, profile };
   scripMasterPromise = null;
+  scripMasterFetchedAt = 0;
+  equityInstrumentsCachedAt = 0;
+  equityInstrumentsCache = null;
   quoteCache = { fetchedAt: 0, quotes: null, key: '' };
   lastCandleRequestAt = 0;
   lastQuoteRequestAt = 0;
@@ -93,6 +101,7 @@ function disconnect() {
   credentials = null;
   quoteCache = { fetchedAt: 0, quotes: null, key: '' };
   candleCache.clear();
+  indicatorCache.clear();
 }
 
 function requireConnection() {
@@ -103,6 +112,12 @@ async function getPositions() {
   requireConnection();
   const result = await requestDhan('/positions');
   return Array.isArray(result.data) ? result.data : [];
+}
+
+async function getSuperOrders() {
+  requireConnection();
+  const result = await requestDhan('/super/orders');
+  return Array.isArray(result.data) ? result.data : (Array.isArray(result) ? result : []);
 }
 
 async function getFunds() {
@@ -118,10 +133,19 @@ function roundToTick(value, tickSize) {
 
 function chooseOptionExpiry(expiries, today = new Date()) {
   const todayDate = istDateTime(today).slice(0, 10);
-  const monthlyByMonth = new Map();
-  for (const expiry of expiries.filter((value) => /^\d{4}-\d{2}-\d{2}$/.test(value)).sort()) {
+  const futureExpiries = expiries.filter((value) => value >= todayDate).sort();
+  const monthlyExpiries = futureExpiries.filter((expiry, index, values) => {
     const month = expiry.slice(0, 7);
-    if (!monthlyByMonth.has(month) || expiry > monthlyByMonth.get(month)) monthlyByMonth.set(month, expiry);
+    return index === values.findLastIndex((candidate) => candidate.slice(0, 7) === month);
+  });
+  let expiry = monthlyExpiries[0];
+  if (!expiry) return null;
+
+  const expiryMidnight = new Date(`${expiry}T00:00:00+05:30`);
+  const todayMidnight = new Date(`${todayDate}T00:00:00+05:30`);
+  const daysToExpiry = Math.ceil((expiryMidnight - todayMidnight) / (24 * 60 * 60 * 1000));
+  if (daysToExpiry <= 7) {
+    expiry = monthlyExpiries[1];
   }
   const monthlyExpiries = [...monthlyByMonth.values()].sort();
   const currentMonth = todayDate.slice(0, 7);
@@ -198,8 +222,8 @@ async function getOptionData(underlying, signal) {
 
 async function createOptionOrderPreview({ symbol, signal, lots, includeMargin = true }) {
   requireConnection();
-  const supportedSymbols = new Set((await getEquityInstruments()).map((instrument) => instrument.symbol));
-  if (!supportedSymbols.has(symbol) || !['BUY', 'SELL'].includes(signal)) {
+  await getEquityInstruments();
+  if (!SCAN_SYMBOLS.includes(symbol) || !['BUY', 'SELL'].includes(signal)) {
     throw new Error('Choose a supported symbol with a confirmed BUY or SELL signal.');
   }
   const stopLossPct = 20;
@@ -277,7 +301,9 @@ async function placeSuperOrder(order) {
 }
 
 async function getScripMaster() {
-  if (!scripMasterPromise) {
+  if (!scripMasterPromise || Date.now() - scripMasterFetchedAt > 6 * 60 * 60 * 1000) {
+    equityInstrumentsCache = null;
+    scripMasterFetchedAt = Date.now();
     scripMasterPromise = (async () => {
       const response = await fetch(SCRIP_MASTER_URL, { signal: AbortSignal.timeout(20000) });
       if (!response.ok) throw new Error(`Could not load Dhan instrument master (${response.status}).`);
@@ -285,27 +311,34 @@ async function getScripMaster() {
       return parse(csv, { columns: true, skip_empty_lines: true, relax_column_count: true });
     })().catch((error) => {
       scripMasterPromise = null;
+      scripMasterFetchedAt = 0;
       throw error;
     });
   }
   return scripMasterPromise;
 }
 
+function deriveFnoEquityInstruments(rows, today) {
+  const optionSymbols = new Set(rows.filter((row) => row.SEM_EXM_EXCH_ID === 'NSE'
+      && row.SEM_INSTRUMENT_NAME === 'OPTSTK'
+      && String(row.SEM_EXPIRY_DATE || '').slice(0, 10) >= today)
+    .map((row) => String(row.SM_SYMBOL_NAME || '').trim())
+    .filter(Boolean));
+  return rows.filter((row) => row.SEM_EXM_EXCH_ID === 'NSE'
+      && row.SEM_INSTRUMENT_NAME === 'EQUITY'
+      && optionSymbols.has(String(row.SEM_TRADING_SYMBOL || '').trim()))
+    .map((row) => ({ symbol: String(row.SEM_TRADING_SYMBOL).trim(), securityId: String(row.SEM_SMST_SECURITY_ID) }))
+    .sort((a, b) => a.symbol.localeCompare(b.symbol));
+}
+
 async function getEquityInstruments() {
+  if (equityInstrumentsCache && Date.now() - equityInstrumentsCachedAt < 6 * 60 * 60 * 1000) return equityInstrumentsCache;
   const rows = await getScripMaster();
-  const fnoSymbols = new Set();
-  for (const instrument of rows) {
-    if (instrument.SEM_EXM_EXCH_ID !== 'NSE' || instrument.SEM_SEGMENT !== 'D' || instrument.SEM_INSTRUMENT_NAME !== 'OPTSTK') continue;
-    const match = instrument.SEM_TRADING_SYMBOL.match(/^(.+?)-[A-Za-z]{3}\d{4}-/);
-    if (match) fnoSymbols.add(match[1]);
-  }
-  const equitiesBySymbol = new Map(rows.filter((instrument) => instrument.SEM_EXM_EXCH_ID === 'NSE' && instrument.SEM_INSTRUMENT_NAME === 'EQUITY').map((instrument) => [instrument.SEM_TRADING_SYMBOL, instrument]));
-  const instruments = [...fnoSymbols].sort().map((symbol) => {
-    const row = equitiesBySymbol.get(symbol);
-    if (!row) throw new Error(`Could not resolve NSE F&O underlying ${symbol} to its equity instrument.`);
-    return { symbol, securityId: String(row.SEM_SMST_SECURITY_ID) };
-  });
-  if (!instruments.length) throw new Error('Dhan instrument master contained no NSE stock-option underlyings.');
+  const instruments = deriveFnoEquityInstruments(rows, istDate(new Date()));
+  if (!instruments.length) throw new Error('Dhan instrument master did not contain current NSE stock-option underlyings.');
+  SCAN_SYMBOLS = instruments.map((item) => item.symbol);
+  equityInstrumentsCache = instruments;
+  equityInstrumentsCachedAt = Date.now();
   return instruments;
 }
 async function getQuotes(instruments, optionSecurityIds = []) {
@@ -941,6 +974,18 @@ function istDate(date) {
   return `${parts.year}-${parts.month}-${parts.day}`;
 }
 
+function isEntryWindowOpen(date = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Kolkata',
+    weekday: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23'
+  }).formatToParts(date).reduce((values, part) => ({ ...values, [part.type]: part.value }), {});
+  const minutes = Number(parts.hour) * 60 + Number(parts.minute);
+  return !['Sat', 'Sun'].includes(parts.weekday) && minutes >= 585 && minutes < 840;
+}
+
 function emaSeries(values, period) {
   if (values.length < period) return [];
   const multiplier = 2 / (period + 1);
@@ -999,7 +1044,7 @@ async function getCandles(instrument) {
   lastCandleRequestAt = Date.now();
 
   const now = new Date();
-  const start = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+  const start = new Date(now.getTime() - 14 * 24 * 60 * 60 * 1000);
   const result = await requestDhan('/charts/intraday', {
     method: 'POST',
     body: JSON.stringify({
@@ -1017,6 +1062,24 @@ async function getCandles(instrument) {
   candleCache.set(instrument.securityId, { fetchedAt: Date.now(), candles });
   return candles;
 }
+
+function scheduleCandleRefresh(instruments) {
+  if (candleRefreshPromise) return;
+  candleRefreshPromise = (async () => {
+    for (const instrument of instruments) {
+      const cached = candleCache.get(instrument.securityId);
+      if (cached && Date.now() - cached.fetchedAt < 15 * 60 * 1000) continue;
+      try {
+        await getCandles(instrument);
+        candleRefreshErrors.delete(instrument.securityId);
+      } catch (error) {
+        candleRefreshErrors.set(instrument.securityId, error.message);
+      }
+    }
+  })().finally(() => { candleRefreshPromise = null; });
+}
+
+const candleRefreshErrors = new Map();
 
 function dayInIndia(timestamp) {
   return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit' })
@@ -1125,6 +1188,7 @@ function rankLiquidInstruments(instruments, quotes, minTurnover = MIN_DAILY_TURN
 async function getLiveScan(optionSecurityIds = []) {
   requireConnection();
   const instruments = await getEquityInstruments();
+  scheduleCandleRefresh(instruments);
   const quotes = await getQuotes(instruments, optionSecurityIds);
   const liquidInstruments = rankLiquidInstruments(instruments, quotes);
   const rows = [];
@@ -1132,12 +1196,22 @@ async function getLiveScan(optionSecurityIds = []) {
     const price = Number(instrument.quote?.last_price);
     let indicators = null;
     let dataError = null;
-    try {
-      const candles = await getCandles(instrument);
-      indicators = calculateIndicators(candles);
-    } catch (error) {
-      dataError = error.message;
+
+    const candleRecord = candleCache.get(instrument.securityId);
+    const candleAge = candleRecord ? Date.now() - candleRecord.fetchedAt : Infinity;
+    if (candleRecord) {
+      const cachedIndicators = indicatorCache.get(instrument.securityId);
+      if (cachedIndicators?.fetchedAt === candleRecord.fetchedAt) indicators = cachedIndicators.value;
+      else {
+        indicators = calculateIndicators(candleRecord.candles);
+        indicatorCache.set(instrument.securityId, { fetchedAt: candleRecord.fetchedAt, value: indicators });
+      }
     }
+    if (candleRefreshErrors.has(instrument.securityId)) dataError = candleRefreshErrors.get(instrument.securityId);
+    else if (!candleRecord) dataError = 'Loading closed 15-minute candles';
+    else if (candleAge >= 15 * 60 * 1000) dataError = 'Refreshing closed 15-minute candles';
+    else if (!indicators) dataError = 'Not enough closed 15-minute candles';
+
     rows.push({
       symbol: instrument.symbol,
       securityId: instrument.securityId,
@@ -1150,14 +1224,20 @@ async function getLiveScan(optionSecurityIds = []) {
       vwap: indicators?.vwap ?? null,
       cpr: indicators?.cpr || null,
       supertrend: indicators?.trend || 'UNAVAILABLE',
-      signal: indicators?.signal || 'WATCH',
+      signal: candleAge < 15 * 60 * 1000 ? (indicators?.signal || 'WATCH') : 'WATCH',
       trend: indicators?.trend || 'Unavailable',
       setup: indicators?.signal === 'BUY' ? 'SELL PUT' : indicators?.signal === 'SELL' ? 'SELL CALL' : 'WAIT',
       lastCandleAt: indicators?.lastCandleAt || null,
-      dataError
+      dataError,
+      dataState: !candleRecord ? 'LOADING' : candleAge >= 15 * 60 * 1000 ? 'REFRESHING' : indicators ? 'READY' : 'UNAVAILABLE'
     });
   }
-  return { results: rows, optionQuotes: quotes.NSE_FNO || {}, scannedUniverse: instruments.length, liquidityThreshold: MIN_DAILY_TURNOVER };
+
+  return {
+    results: rows,
+    optionQuotes: quotes.NSE_FNO || {},
+    quotesUpdatedAt: quoteCache.fetchedAt ? new Date(quoteCache.fetchedAt).toISOString() : null
+  };
 }
 
 module.exports = {
@@ -1165,14 +1245,16 @@ module.exports = {
   disconnect,
   getConnection,
   getPositions,
+  getSuperOrders,
   getFunds,
   getLiveScan,
   createOptionOrderPreview,
   placeSuperOrder,
   requireConnection,
   chooseOptionExpiry,
-  rankLiquidInstruments,
+  deriveFnoEquityInstruments,
   istDate,
+  isEntryWindowOpen,
   calculatePreviousDayCpr,
   confirmedSignal,
   calculateShortOptionRisk

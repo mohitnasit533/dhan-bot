@@ -5,3 +5,5 @@ node_modules/
 npm-debug.log*
 .DS_Store
 .claude/
+.dhan-auto-state.json
+.dhan-auto-state.json.tmp
