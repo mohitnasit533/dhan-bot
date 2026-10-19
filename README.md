@@ -26,7 +26,7 @@ Run the strategy tests with `npm test`.
 - Short-option premium risk is fixed at a 20% stop loss and 50% target.
 - Use the current monthly stock-option expiry through its final seven calendar days, then shift to the next month’s chain.
 - New entries are restricted to weekdays from 09:45 until before 14:00 IST. Up to five positions may be open.
-- The scanner discovers current NSE stock-option underlyings from Dhan's security master. Cash prices refresh about once per second; indicators and entries use closed 15-minute candles.
+- The scanner discovers NSE stock-option underlyings from Dhan's security master, filters for at least INR 5 crore in daily traded value, and ranks qualifying stocks by turnover. Cash prices refresh about once per second; indicators and entries use closed 15-minute candles.
 - Auto trade is off by default. Paper mode simulates confirmed signals. In Live mode, enabling Auto trade allows the server to place real option super orders without per-order confirmation. The server keeps scanning while it is running, even if the dashboard tab is closed.
 
 The turnover filter and strategy rules are implementation settings, not a guarantee of trading performance. Verify all contract details and order values before enabling live trading.

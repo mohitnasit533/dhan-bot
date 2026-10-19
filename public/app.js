@@ -86,11 +86,11 @@ function renderScanner(results = []) {
   const visibleResults = search ? results.filter((row) => row.symbol.includes(search)) : results;
   if (!visibleResults.length) {
     scannerRenderSignature = '';
-    body.innerHTML = `<tr><td colspan="9" class="empty">${connected ? 'No scanner data returned.' : 'Connect Dhan to see scanner results.'}</td></tr>`;
+    body.innerHTML = `<tr><td colspan="10" class="empty">${connected ? 'No scanner data returned.' : 'Connect Dhan to see scanner results.'}</td></tr>`;
     return;
   }
   const signature = JSON.stringify(visibleResults.map((row) => [
-    row.symbol, row.ema21, row.ema34, row.vwap, row.cpr, row.trend, row.signal, row.setup, row.dataError
+    row.symbol, row.turnover, row.ema21, row.ema34, row.vwap, row.cpr, row.trend, row.signal, row.setup, row.dataError
   ]));
   if (signature !== scannerRenderSignature) {
     body.innerHTML = visibleResults.map((row) => {
@@ -121,8 +121,10 @@ function renderScanner(results = []) {
     .map((row) => [row.dataset.symbol, row]));
   for (const row of visibleResults) {
     const rendered = rowsBySymbol.get(row.symbol);
-    if (rendered && rendered.cells[1].textContent !== formatPrice(row.price)) {
-      rendered.cells[1].textContent = formatPrice(row.price);
+    if (rendered) {
+      const turnover = Number.isFinite(Number(row.turnover)) ? (Number(row.turnover) / 10000000).toFixed(1) : '—';
+      if (rendered.cells[1].textContent !== turnover) rendered.cells[1].textContent = turnover;
+      if (rendered.cells[2].textContent !== formatPrice(row.price)) rendered.cells[2].textContent = formatPrice(row.price);
     }
   }
 }
