@@ -13,11 +13,13 @@ A local dashboard for scanning current NSE stock-option underlyings through Dhan
 
 ## Run locally
 
-Run `npm install` and then `npm start` from PowerShell.
+From PowerShell, run `npm.cmd install` and then `npm.cmd start`. Keep that terminal open while using the dashboard; pressing Ctrl+C or closing the terminal stops the server.
 
 Open <http://localhost:3000/>.
 
-Run the strategy tests with `npm test`.
+Run the strategy tests with `npm.cmd test`.
+
+Check whether the server is running at <http://localhost:3000/api/health>. If startup reports that the port is already in use, stop the other process using it or choose another `PORT` in `.env`.
 
 ## Strategy and controls
 
@@ -33,6 +35,10 @@ The turnover filter and strategy rules are implementation settings, not a guaran
 
 ## Credentials and security
 
-Enter the Dhan client ID and access token in the local dashboard. The server holds credentials in memory only; do not commit access tokens or `.env` files. Disconnecting clears the in-memory connection.
+Save the Dhan client ID and a current access token in `.env` (copy the names from `.env.example`); this file is ignored by Git. With both values set, the server verifies the account on startup, renews the active token, and saves the replacement token back to `.env`. It then renews every 20 hours while the server is running. Use an access token generated through Dhan Web: [Dhan's authentication docs](https://dhanhq.co/docs/v2/authentication/) document the `RenewToken` endpoint for active Web-generated tokens only.
+
+Dhan currently documents access tokens as valid for 24 hours, not 30 days. Automatic renewal avoids routine daily token replacement when the app can reach Dhan and the original token is still active. If the app stays offline until the token expires, or Dhan does not allow renewal for that token, generate a fresh token and update `.env`. Tokens entered only in the dashboard are held in memory and are not persisted for automatic renewal. Disconnecting clears the in-memory connection.
+
+`.env` is plain text, not encrypted: keep access to your Windows account private, never share or commit the file, and never paste real credentials into `.env.example`.
 
 The API accepts loopback hosts and same-origin browser mutations only. Live order submission checks broker positions and active super orders, and reserves each underlying while a submission is pending or its result is uncertain. Auto-trade signal timestamps are saved locally (without credentials) to prevent the same closed-candle signal from re-entering after a restart or after a position is squared off through another Dhan device. If a submission times out, check Dhan's order book before retrying; the app intentionally blocks another order until it can reconcile the first.

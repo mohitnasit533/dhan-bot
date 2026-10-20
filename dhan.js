@@ -22,7 +22,9 @@ let equityInstrumentsCachedAt = 0;
 const candleRefreshErrors = new Map();
 
 function safeErrorMessage(payload, fallback) {
-  return payload?.errorMessage || payload?.remarks?.error_message || payload?.message || fallback;
+  return payload?.errorMessage || payload?.remarks?.error_message
+    || (typeof payload?.remarks === 'string' ? payload.remarks : null)
+    || payload?.message || fallback;
 }
 
 async function requestDhan(path, options = {}, token = credentials?.accessToken) {
@@ -81,6 +83,38 @@ async function connect(clientId, accessToken) {
   candleCache.clear();
   indicatorCache.clear();
   return publicProfile(profile);
+}
+
+async function renewAccessToken() {
+  requireConnection();
+  const { clientId, accessToken } = credentials;
+  const response = await fetch(`${API_BASE}/RenewToken`, {
+    method: 'GET',
+    signal: AbortSignal.timeout(15000),
+    headers: {
+      'access-token': accessToken,
+      dhanClientId: clientId
+    }
+  });
+  const payload = await response.json().catch(() => null);
+  if (!response.ok || payload?.status === 'failure') {
+    throw new Error(safeErrorMessage(payload, `Dhan token renewal failed (${response.status}).`));
+  }
+
+  const renewedToken = payload?.accessToken || payload?.data?.accessToken;
+  if (typeof renewedToken !== 'string' || renewedToken.length < 20) {
+    throw new Error('Dhan token renewal returned no valid access token.');
+  }
+  const renewedClientId = String(payload?.dhanClientId || payload?.data?.dhanClientId || '').trim();
+  if (renewedClientId && renewedClientId !== clientId) {
+    throw new Error('Dhan token renewal returned credentials for a different Client ID.');
+  }
+
+  credentials.accessToken = renewedToken;
+  return {
+    accessToken: renewedToken,
+    expiryTime: payload.expiryTime || payload.data?.expiryTime || null
+  };
 }
 
 function publicProfile(profile = credentials?.profile) {
@@ -635,6 +669,7 @@ async function getLiveScan(optionSecurityIds = []) {
 
 module.exports = {
   connect,
+  renewAccessToken,
   disconnect,
   getConnection,
   getPositions,

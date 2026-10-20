@@ -3,6 +3,7 @@
 const express = require('express');
 const path = require('path');
 const { randomUUID } = require('node:crypto');
+require('dotenv').config({ path: path.join(__dirname, '.env') });
 const helmet = require('helmet');
 const { rateLimit } = require('express-rate-limit');
 const dhan = require('./dhan');
@@ -10,14 +11,20 @@ const { isEntryWindowOpen } = dhan;
 const { isAllowedLocalHost, isSameOriginRequest } = require('./local-security');
 const { findActiveSuperOrder, isTerminalSuperOrder, findReconciledOrder } = require('./live-order-guard');
 const { createAutoSignalStore } = require('./auto-signal-store');
+const { saveAccessToken } = require('./token-env-store');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const HOST = '127.0.0.1';
 const AUTO_SIGNAL_STATE_PATH = path.join(__dirname, '.dhan-auto-state.json');
+const ENV_FILE_PATH = path.join(__dirname, '.env');
+const TOKEN_RENEW_INTERVAL_MS = 20 * 60 * 60 * 1000;
+const TOKEN_RETRY_INTERVAL_MS = 10 * 60 * 1000;
 const MAX_ACTIVE_TRADES = 5;
 const MAX_CLOSED_TRADES = 1000;
 let tradingMode = 'PAPER';
+let tokenRenewalTimer = null;
+let tokenRenewalStatus = { enabled: false, message: 'Add Dhan credentials to .env to enable automatic token renewal.' };
 
 app.use(helmet({
   hsts: false,
@@ -86,6 +93,40 @@ function recordClosedTrade(trade) {
 
 function getActiveTradesList() {
   return Array.from(activeTrades.values());
+}
+
+function saveRenewedToken(accessToken) {
+  saveAccessToken(ENV_FILE_PATH, accessToken);
+  process.env.DHAN_ACCESS_TOKEN = accessToken;
+}
+
+function scheduleTokenRenewal(delayMs, retriesRemaining = 2) {
+  if (tokenRenewalTimer) clearTimeout(tokenRenewalTimer);
+  tokenRenewalTimer = setTimeout(() => renewConfiguredToken(retriesRemaining), delayMs);
+  tokenRenewalTimer.unref();
+}
+
+async function renewConfiguredToken(retriesRemaining = 2) {
+  try {
+    const renewed = await dhan.renewAccessToken();
+    saveRenewedToken(renewed.accessToken);
+    tokenRenewalStatus = {
+      enabled: true,
+      message: 'Automatic renewal active. Dhan access token saved locally.',
+      expiryTime: renewed.expiryTime,
+      renewedAt: new Date().toISOString()
+    };
+    console.log('Dhan access token renewed and saved to the local .env file.');
+    scheduleTokenRenewal(TOKEN_RENEW_INTERVAL_MS);
+  } catch (error) {
+    tokenRenewalStatus = {
+      enabled: false,
+      message: `Automatic renewal failed: ${error.message} Dhan Web tokens are valid for 24 hours; enter a fresh active token in .env if renewal is unavailable.`,
+      failedAt: new Date().toISOString()
+    };
+    console.error(tokenRenewalStatus.message);
+    if (retriesRemaining > 0) scheduleTokenRenewal(TOKEN_RETRY_INTERVAL_MS, retriesRemaining - 1);
+  }
 }
 
 function createPaperTrade(preview) {
@@ -341,6 +382,7 @@ app.get('/api/connection', (req, res) => {
     connected: Boolean(dhan.getConnection()),
     profile: dhan.getConnection(),
     mode: tradingMode,
+    tokenRenewal: tokenRenewalStatus,
     autoTrade: autoTradeConfig.enabled,
     settings: autoTradeConfig.settings
   });
@@ -355,14 +397,22 @@ app.post('/api/connect', rateLimit({
 }), async (req, res) => {
   try {
     const profile = await dhan.connect(req.body?.clientId, req.body?.accessToken);
+    if (process.env.DHAN_CLIENT_ID?.trim() === String(req.body?.clientId || '').trim()
+      && process.env.DHAN_ACCESS_TOKEN?.trim() === String(req.body?.accessToken || '').trim()) {
+      tokenRenewalStatus = { enabled: true, message: 'Dhan token connected. Automatic renewal is starting.' };
+      renewConfiguredToken();
+    }
     res.json({
       ok: true,
       connected: true,
       profile,
       mode: tradingMode,
+      tokenRenewal: tokenRenewalStatus,
       autoTrade: autoTradeConfig.enabled,
       settings: autoTradeConfig.settings,
-      message: `Connected to Dhan as ${profile.name}. Credentials are held in server memory only.`
+      message: tokenRenewalStatus.enabled
+        ? `Connected to Dhan as ${profile.name}. Automatic token renewal is enabled.`
+        : `Connected to Dhan as ${profile.name}. Credentials are held in server memory only.`
     });
   } catch (error) {
     res.status(error.statusCode || 400).json({ ok: false, connected: false, message: error.message });
@@ -370,6 +420,9 @@ app.post('/api/connect', rateLimit({
 });
 
 app.post('/api/disconnect', (req, res) => {
+  if (tokenRenewalTimer) clearTimeout(tokenRenewalTimer);
+  tokenRenewalTimer = null;
+  tokenRenewalStatus = { enabled: false, message: 'Dhan account disconnected.' };
   dhan.disconnect();
   tradingMode = 'PAPER';
   autoTradeConfig.enabled = false;
@@ -688,8 +741,33 @@ app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-app.listen(PORT, HOST, () => {
+const server = app.listen(PORT, HOST, () => {
   console.log(`Dhan Intraday Desk running at http://localhost:${PORT}`);
+  const clientId = process.env.DHAN_CLIENT_ID?.trim();
+  const accessToken = process.env.DHAN_ACCESS_TOKEN?.trim();
+
+  if (!clientId && !accessToken) return;
+  if (!clientId || !accessToken) {
+    console.error('Dhan startup connection skipped: set both DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN in .env.');
+    return;
+  }
+
+  dhan.connect(clientId, accessToken)
+    .then((profile) => {
+      console.log(`Connected to Dhan as ${profile.name} using .env credentials.`);
+      tokenRenewalStatus = { enabled: true, message: 'Dhan token connected. Automatic renewal is starting.' };
+      renewConfiguredToken();
+    })
+    .catch((error) => console.error(`Dhan startup connection failed: ${error.message}`));
+});
+
+server.on('error', (error) => {
+  if (error.code === 'EADDRINUSE') {
+    console.error(`Could not start: port ${PORT} is already in use. Stop the other server or set a different PORT in .env.`);
+  } else {
+    console.error(`Could not start the local server: ${error.message}`);
+  }
+  process.exitCode = 1;
 });
 
 const serverAutoScanTimer = setInterval(() => {

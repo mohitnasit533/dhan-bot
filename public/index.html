@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#101613">
-  <title>Dhan Intraday Desk</title>
+  <meta name="theme-color" content="#080f21">
+  <title>Dhan Desk</title>
   <style>
     :root {
       color-scheme: dark;
@@ -158,6 +158,172 @@
       .scan-meta { justify-items: start; text-align: left; }
     }
     @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; transition-duration: .01ms !important; } }
+    :root {
+      --bg: #080f21;
+      --surface: #111c39;
+      --surface-raised: #172344;
+      --line: #26365d;
+      --text: #f1f4ff;
+      --muted: #95a7d6;
+      --green: #27d4a1;
+      --red: #ff5d87;
+      --amber: #ff982e;
+      --cyan: #84a6ff;
+    }
+    body { background: var(--bg); color: var(--text); }
+    button { border-radius: 7px; }
+    button.primary, #save-settings, #execute-order { background: var(--amber); border-color: var(--amber); color: #111629; font-weight: 750; }
+    button.primary:hover:not(:disabled), #save-settings:hover:not(:disabled), #execute-order:hover:not(:disabled) { background: #ffad55; border-color: #ffad55; }
+    input, select { background: #0a1228; border-color: #29395f; border-radius: 6px; }
+    .shell { width: min(1320px, 100%); padding: 0 28px 26px; }
+    header { position: sticky; z-index: 5; top: 0; min-height: 58px; margin: 0 -28px 20px; padding: 0 28px; border-bottom: 1px solid #192544; background: #080f21ed; backdrop-filter: blur(16px); }
+    h1 { font-size: clamp(25px, 3vw, 36px); line-height: 1.08; letter-spacing: -.035em; }
+    h2 { font-size: 20px; letter-spacing: -.025em; }
+    .brand { gap: 9px; }
+    .brand h1 { font-size: 15px; letter-spacing: 0; }
+    .brand .subtitle { display: none; }
+    .logo { width: 27px; height: 27px; border-radius: 7px; background: var(--amber); color: #12182b; box-shadow: none; }
+    .main-nav { display: flex; gap: 22px; margin-right: auto; margin-left: 22px; }
+    .main-nav a { color: #aebadd; font-size: 12px; text-decoration: none; }
+    .main-nav a:hover { color: white; }
+    .header-actions { gap: 10px; }
+    .header-actions > label:not(.switch) { min-width: 84px !important; }
+    .header-actions > label:not(.switch) > span { display: none; }
+    .header-actions label { font-size: 10px; }
+    .header-actions .status { padding: 5px 9px; font-size: 11px; color: var(--text); }
+    .hero { position: relative; display: grid; grid-template-columns: 150px minmax(0, 1fr) 250px; align-items: center; gap: 24px; min-height: 198px; margin: 0 -28px; padding: 24px 28px; overflow: hidden; border-bottom: 1px solid var(--line); }
+    .hero::before { content: ""; position: absolute; inset: 0; pointer-events: none; background: linear-gradient(90deg, #080f21a8, #080f2155 55%, #080f21dc); }
+    .hero-chart { position: absolute; inset: 0; width: 100%; height: 100%; opacity: .45; }
+    .hero > *:not(.hero-chart) { position: relative; z-index: 1; }
+    .countdown { display: grid; place-items: center; width: 138px; height: 138px; position: relative; }
+    .countdown svg { position: absolute; inset: 0; width: 100%; height: 100%; transform: rotate(-90deg); }
+    .countdown circle { fill: none; stroke-width: 5; }
+    .countdown .track { stroke: #223259; }
+    .countdown .progress { stroke: var(--amber); stroke-linecap: round; stroke-dasharray: 377; stroke-dashoffset: 110; }
+    .countdown-copy { text-align: center; }
+    .countdown-copy span { display: block; color: #aebadd; font-size: 10px; line-height: 1.3; }
+    .countdown-copy strong { font-size: 30px; line-height: 1.1; }
+    .hero-copy { max-width: 520px; }
+    .hero-copy .subtitle { margin-top: 7px; font-size: 12px; }
+    .session-timeline { display: flex; align-items: center; gap: 4px; height: 8px; margin-top: 20px; }
+    .session-timeline span { height: 6px; border-radius: 99px; background: #304578; }
+    .session-timeline span:nth-child(1) { width: 12%; }
+    .session-timeline span:nth-child(2) { width: 40%; background: var(--amber); }
+    .session-timeline span:nth-child(3) { width: 15%; }
+    .session-timeline span:nth-child(4) { width: 3%; background: var(--red); }
+    .session-labels, .session-legend { display: flex; justify-content: space-between; color: #98a9d4; font-size: 9px; }
+    .session-legend { justify-content: flex-start; flex-wrap: wrap; gap: 12px; margin-top: 8px; }
+    .legend-dot { display: inline-block; width: 7px; height: 7px; margin-right: 4px; border-radius: 50%; background: var(--cyan); }
+    .legend-dot.new { background: var(--amber); }
+    .legend-dot.manage { background: #6882c2; }
+    .legend-dot.square { background: var(--red); }
+    .hero-account { padding: 15px; border: 1px solid var(--line); border-radius: 12px; background: #111c39ed; }
+    .hero-account h2 { margin-bottom: 10px; font-size: 14px; }
+    #connect-form { gap: 8px; }
+    #connect-form label { gap: 3px; font-size: 10px; }
+    #connect-form input { padding: 7px 8px; font-size: 11px; }
+    #connect-form .inline { flex-wrap: wrap; gap: 7px; }
+    #connect-form button { padding: 7px 10px; font-size: 11px; }
+    #connection-info { margin-top: 8px; font-size: 10px; line-height: 1.4; }
+    .dashboard-stats { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); margin: 0 0 28px; border-bottom: 1px solid #1d2b4c; }
+    .dashboard-stat { display: flex; align-items: center; gap: 10px; min-height: 66px; padding: 9px 14px; border-right: 1px solid #243253; }
+    .dashboard-stat:last-child { border: 0; }
+    .dashboard-stat strong { color: var(--text); font-size: 25px; line-height: 1; white-space: nowrap; }
+    .dashboard-stat.buy strong { color: var(--green); }
+    .dashboard-stat.sell strong { color: var(--red); }
+    .dashboard-stat span { display: block; font-size: 10px; font-weight: 700; line-height: 1.2; }
+    .dashboard-stat small { display: block; margin-top: 3px; color: var(--muted); font-size: 9px; }
+    .section-heading { display: flex; align-items: end; justify-content: space-between; gap: 16px; margin: 22px 0 10px; }
+    .section-heading .note { margin-top: 2px; font-size: 10px; }
+    .section-heading .scan-meta { display: flex; align-items: center; gap: 12px; }
+    .signal-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 230px)); gap: 12px; margin-bottom: 24px; }
+    .signal-card { position: relative; padding: 12px; overflow: hidden; border: 1px solid #2a3a62; border-top: 2px solid var(--green); border-radius: 11px; background: #111c39; }
+    .signal-card.sell { border-top-color: var(--red); }
+    .signal-title { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+    .signal-title strong { font-size: 16px; }
+    .signal-title span { font-weight: 700; }
+    .signal-card .note { margin: 0; font-size: 9px; }
+    .signal-card .signal-data { display: grid; grid-template-columns: 1fr 1fr; gap: 5px 9px; margin: 10px 0; font-size: 9px; }
+    .signal-card .signal-data b { display: block; color: #c3cdef; font-size: 10px; }
+    .signal-card button { width: 100%; padding: 7px 10px; font-size: 11px; }
+    .scanner-card { position: relative; overflow: hidden; background: transparent; padding: 0; border: 0; box-shadow: none; animation: none; }
+    .scanner-card::before, .scanner-card .card-head, .scanner-card .stats { display: none; }
+    .scanner-card:hover { border-color: transparent; box-shadow: none; }
+    .scanner-card th { font-size: 9px; }
+    .scanner-card td { font-size: 10px; }
+    .scanner-card th, .scanner-card td { padding: 9px 8px; }
+    .scanner-card .table-wrap, .positions-card .table-wrap { border: 1px solid #26365d; border-radius: 11px; background: #111c39; }
+    .scanner-card .pill { font-size: 9px; padding: 2px 7px; }
+    .scanner-card .small-button { background: var(--amber); border-color: var(--amber); color: #111629; }
+    .positions-card { padding: 0; border: 0; background: transparent; box-shadow: none; animation: none; }
+    .positions-card:hover { border-color: transparent; box-shadow: none; }
+    .positions-card .card-head { margin: 22px 0 10px; }
+    .positions-card th { font-size: 9px; }
+    .positions-card td { font-size: 10px; }
+    .positions-card th, .positions-card td { padding: 9px 8px; }
+    .positions-card .close-button { color: var(--red); background: transparent; }
+    .bottom-grid { display: grid; grid-template-columns: minmax(290px, 360px) minmax(0, 1fr); gap: 16px; align-items: start; margin-top: 22px; }
+    .bottom-grid .card { border-radius: 12px; background: #111c39; box-shadow: none; animation: none; }
+    .bottom-grid .card:hover { border-color: #344875; box-shadow: none; }
+    .bottom-grid .card-head { margin-bottom: 12px; }
+    .rules-list { display: grid; gap: 7px; margin-top: 12px; }
+    .rule { display: grid; grid-template-columns: 24px 1fr; gap: 6px; padding: 9px; border: 1px solid #26365d; border-radius: 8px; background: #0a1228; }
+    .rule-mark { color: var(--amber); }
+    .rule strong { display: block; font-size: 11px; }
+    .rule span { display: block; color: var(--muted); font-size: 9px; }
+    .rule-side { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; margin-top: 10px; }
+    .rule-side div { padding: 8px; border: 1px solid #2d765f; border-radius: 8px; color: var(--green); font-size: 10px; }
+    .rule-side div:last-child { border-color: #79394f; color: var(--red); }
+    .control-facts { display: grid; gap: 8px; margin-top: 13px; }
+    .control-facts div { display: flex; justify-content: space-between; gap: 8px; color: var(--muted); font-size: 10px; }
+    .control-facts strong { color: var(--text); text-align: right; font-weight: 500; }
+    .footer { margin-top: 30px; padding-top: 16px; border-top: 1px solid #1d2b4c; font-size: 10px; }
+    @media (max-width: 900px) {
+      .shell { padding: 0 18px 22px; }
+      header { margin-right: -18px; margin-left: -18px; padding: 0 18px; }
+      .hero { grid-template-columns: 105px minmax(0, 1fr) 205px; gap: 14px; margin: 0 -18px; padding: 20px 18px; }
+      .countdown { width: 100px; height: 100px; }
+      .hero-account { grid-column: auto; padding: 11px; }
+      .hero-account #connect-form { grid-template-columns: 1fr; }
+      .dashboard-stats { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+      .dashboard-stat { gap: 7px; padding: 8px; }
+      .dashboard-stat strong { font-size: 21px; }
+      .dashboard-stat:nth-child(4) strong { font-size: 13px; white-space: normal; }
+      .bottom-grid { grid-template-columns: 1fr 1fr; }
+    }
+    @media (max-width: 600px) {
+      .shell { padding: 0 13px 18px; }
+      header { min-height: 54px; margin-right: -13px; margin-left: -13px; padding: 7px 13px; }
+      header { align-items: center; flex-direction: row; }
+      .main-nav { display: none; }
+      .header-actions { width: auto; justify-content: flex-end; gap: 6px; }
+      .header-actions .status { max-width: 130px; overflow: hidden; font-size: 9px; white-space: nowrap; }
+      .header-actions .switch { font-size: 9px; }
+      .header-actions > label:not(.switch) { min-width: 70px !important; }
+      .hero { grid-template-columns: 82px minmax(0, 1fr); gap: 12px; margin: 0 -13px; padding: 18px 13px; }
+      .countdown { width: 80px; height: 80px; }
+      .countdown circle { stroke-width: 7; }
+      .countdown-copy span { font-size: 7px; }
+      .countdown-copy strong { font-size: 19px; }
+      .hero-copy h1 { font-size: 24px; }
+      .hero-copy .subtitle { font-size: 10px; }
+      .session-timeline { margin-top: 12px; }
+      .session-labels, .session-legend { font-size: 7px; }
+      .hero-account { grid-column: 1 / -1; }
+      .hero-account #connect-form { grid-template-columns: 1fr; }
+      .dashboard-stats { grid-template-columns: repeat(2, 1fr); margin-bottom: 20px; }
+      .dashboard-stat { min-height: 56px; padding: 7px; }
+      .dashboard-stat strong { font-size: 20px; }
+      .dashboard-stat span { font-size: 9px; }
+      .dashboard-stat:nth-child(2), .dashboard-stat:nth-child(4) { border-right: 0; }
+      .dashboard-stat:nth-child(3) { border-right: 1px solid #243253; }
+      .dashboard-stat:nth-child(n+3) { border-top: 1px solid #243253; }
+      .section-heading { align-items: flex-start; flex-direction: column; gap: 6px; }
+      .section-heading .scan-meta { width: 100%; justify-content: space-between; text-align: left; }
+      .signal-cards { grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); }
+      .bottom-grid { grid-template-columns: 1fr; }
+      .card { padding: 12px; }
+    }
   </style>
 </head>
 <body>
@@ -166,10 +332,13 @@
       <div class="brand">
         <div class="logo" aria-hidden="true">D</div>
         <div>
-          <h1>Dhan Intraday Desk</h1>
+          <h1>Dhan Desk</h1>
           <p class="subtitle">15-minute scanner · options workspace</p>
         </div>
       </div>
+      <nav class="main-nav" aria-label="Dashboard navigation">
+        <a href="#signals">Signals</a><a href="#scanner">Scanner</a><a href="#positions">Positions</a><a href="#setup">Setup</a>
+      </nav>
       <div class="header-actions">
         <span id="connection-status" class="status"><span class="dot"></span><span>Checking connection</span></span>
         <label class="switch" title="Refresh market scanner every second">
@@ -177,19 +346,129 @@
           <span>Auto scan</span>
         </label>
         <label style="min-width:130px">
-          Trading mode
+          <span>Trading mode</span>
           <select id="mode-select" aria-label="Trading mode">
             <option value="PAPER">Paper</option>
             <option value="LIVE">Live</option>
           </select>
         </label>
-        <button id="refresh-button" type="button">Refresh scanner</button>
       </div>
     </header>
 
     <div id="notice" class="notice" role="status" aria-live="polite"></div>
 
-    <div class="grid">
+    <section class="hero" aria-label="Market session">
+      <svg class="hero-chart" viewBox="0 0 1400 210" preserveAspectRatio="none" aria-hidden="true">
+        <path d="M0 128 C60 104 84 154 142 122 S220 145 278 102 S360 125 420 88 S510 126 565 96 S646 117 710 82 S810 123 866 89 S950 106 1010 72 S1108 115 1170 78 S1302 116 1400 65" fill="none" stroke="#5572b8" stroke-width="2"/>
+        <path d="M0 154 C110 137 144 163 245 129 S380 153 495 121 S630 142 744 112 S900 144 1012 105 S1190 132 1400 95" fill="none" stroke="#ff982e" stroke-opacity=".55" stroke-width="2"/>
+        <g fill="#27d4a1" opacity=".7"><rect x="48" y="112" width="7" height="23"/><rect x="158" y="119" width="7" height="19"/><rect x="333" y="94" width="7" height="21"/><rect x="514" y="87" width="7" height="23"/><rect x="690" y="78" width="7" height="18"/><rect x="878" y="84" width="7" height="22"/><rect x="1087" y="68" width="7" height="20"/><rect x="1260" y="75" width="7" height="19"/></g>
+      </svg>
+      <div class="countdown" aria-label="Time until next 15-minute candle">
+        <svg viewBox="0 0 140 140" aria-hidden="true"><circle class="track" cx="70" cy="70" r="60"/><circle class="progress" cx="70" cy="70" r="60"/></svg>
+        <div class="countdown-copy"><span>Next 15-minute<br>candle closes in</span><strong id="candle-countdown">--:--</strong></div>
+      </div>
+      <div class="hero-copy">
+        <h1 id="market-headline">New entries are open</h1>
+        <p class="subtitle">Entries stop at 14:00 IST. Signals use closed 15-minute candles.</p>
+        <div class="session-timeline" aria-hidden="true"><span></span><span></span><span></span><span></span></div>
+        <div class="session-labels"><span>09:45</span><span>14:00</span><span>15:15</span></div>
+        <div class="session-legend"><span><i class="legend-dot"></i>Opening range</span><span><i class="legend-dot new"></i>New entries</span><span><i class="legend-dot manage"></i>Manage only</span><span><i class="legend-dot square"></i>Square-off</span></div>
+      </div>
+      <section class="hero-account" aria-label="Dhan account">
+        <h2>Dhan account</h2>
+        <form id="connect-form" class="form-grid">
+          <label>Client ID
+            <input name="clientId" inputmode="numeric" autocomplete="username" required pattern="[0-9]{6,12}" placeholder="Your Dhan Client ID">
+          </label>
+          <label>Access token
+            <input name="accessToken" type="password" autocomplete="off" required minlength="20" maxlength="4096" placeholder="Paste access token">
+          </label>
+          <div class="inline">
+            <button class="primary" type="submit">Connect</button>
+            <button id="disconnect-button" type="button" class="danger hidden">Disconnect</button>
+          </div>
+        </form>
+        <p id="connection-info" class="note">Credentials stay on this computer.</p>
+      </section>
+    </section>
+
+    <section class="dashboard-stats" aria-label="Trading overview">
+      <div class="dashboard-stat buy"><strong id="buy-count">—</strong><div><span>Bullish signals</span><small>Sell put setups</small></div></div>
+      <div class="dashboard-stat sell"><strong id="sell-count">—</strong><div><span>Bearish signals</span><small>Sell call setups</small></div></div>
+      <div class="dashboard-stat"><strong id="position-count">0 / 5</strong><div><span>Open positions</span><small id="positions-mode">Paper positions</small></div></div>
+      <div class="dashboard-stat"><strong id="trade-mode-label">Manual</strong><div><span>Entry mode</span><small>Change in Setup</small></div></div>
+      <div class="dashboard-stat"><strong id="entry-state">—</strong><div><span>Entry window</span><small>Weekdays · IST</small></div></div>
+    </section>
+
+    <section id="signals">
+      <div class="section-heading">
+        <div><h2>Signals ready to trade</h2><p id="scanner-caption" class="note">Connect your account to load market data.</p></div>
+        <div class="scan-meta"><span id="updated-at" class="muted"></span><span id="scan-indicator" class="scan-indicator"><i></i><span>Auto scan on</span></span><button id="refresh-button" class="small-button" type="button">Refresh scanner</button></div>
+      </div>
+      <div id="signal-cards" class="signal-cards"><p class="note">Connect Dhan to see current signals.</p></div>
+    </section>
+
+    <section id="scanner">
+      <div class="section-heading"><div><h2>All liquid stocks</h2><p class="note">Current NSE F&amp;O stocks ranked by traded value.</p></div>
+        <label class="note" for="scanner-filter">Filter stocks<input id="scanner-filter" type="search" placeholder="Search symbol" autocomplete="off"></label>
+      </div>
+      <section class="card scanner-card" id="scanner-card">
+        <div class="table-wrap"><table>
+          <thead><tr><th>Stock</th><th>Turnover (₹ Cr)</th><th>Price</th><th>EMA 21 / 34</th><th>VWAP</th><th>CPR</th><th>Trend</th><th>Signal</th><th>Setup</th><th>Action</th></tr></thead>
+          <tbody id="scanner-body"><tr><td colspan="10" class="empty">Connect Dhan to see scanner results.</td></tr></tbody>
+        </table></div>
+      </section>
+    </section>
+
+    <section id="positions" class="positions-card">
+      <div class="card-head"><div><h2>Open positions</h2><p class="note">Track where the option price sits between your target and stop.</p></div></div>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Symbol</th><th>Position</th><th>Qty</th><th>Entry</th><th>Current</th><th>P&amp;L %</th><th>Stop / Target</th><th></th></tr></thead>
+        <tbody id="positions-body"><tr><td colspan="8" class="empty">No open paper positions.</td></tr></tbody>
+      </table></div>
+    </section>
+
+    <div class="bottom-grid" id="setup">
+      <section class="card">
+        <div class="card-head"><h2>Trade controls</h2></div>
+        <form id="trade-settings" class="form-grid">
+          <div class="two-col">
+            <label>Lots<input name="lots" type="number" min="1" max="1000" step="1" value="1" required></label>
+            <label>Max positions<input name="maxTrades" type="number" min="1" max="5" step="1" value="5" required></label>
+          </div>
+          <label class="switch"><input name="autoTrade" type="checkbox" role="switch"><span>Auto trade</span></label>
+          <p class="note" id="auto-trade-help">Off: review each setup and confirm entries. On: paper signals are simulated; live signals may place orders automatically.</p>
+          <button id="save-settings" type="submit">Save settings</button>
+        </form>
+        <div class="control-facts">
+          <div><span>Stop loss</span><strong>20% above entry premium</strong></div>
+          <div><span>Target</span><strong>Premium falls to 50%</strong></div>
+          <div><span>New entries</span><strong>Weekdays 09:45–14:00 IST</strong></div>
+          <div><span>Paper exit</span><strong>15:15 IST</strong></div>
+          <div><span>Live orders</span><strong>Dhan static IP required</strong></div>
+        </div>
+      </section>
+      <section class="card">
+        <div class="card-head"><div><h2>How a signal is confirmed</h2><p class="note">All four checks must agree on a closed 15-minute candle.</p></div></div>
+        <div class="rules-list">
+          <div class="rule"><i class="rule-mark">◉</i><div><strong>EMA 21 crosses EMA 34</strong><span>The crossover happens on the latest closed candle.</span></div></div>
+          <div class="rule"><i class="rule-mark">◉</i><div><strong>Supertrend agrees</strong><span>Its direction matches the crossover.</span></div></div>
+          <div class="rule"><i class="rule-mark">◉</i><div><strong>Close beats VWAP</strong><span>Above VWAP for bullish, below for bearish.</span></div></div>
+          <div class="rule"><i class="rule-mark">◉</i><div><strong>Narrow CPR breakout</strong><span>CPR is no more than 0.5% of prior close; price closes outside it.</span></div></div>
+        </div>
+        <div class="rule-side"><div><strong>Bullish</strong><span>Sell a put near −0.40 delta</span></div><div><strong>Bearish</strong><span>Sell a call near +0.40 delta</span></div></div>
+        <p class="note">Expiry: current monthly contract, switching to next month during its final seven days. Short options can lose substantially more than the premium received.</p>
+      </section>
+    </div>
+
+    <section id="preview-card" class="card hidden section-gap">
+      <div class="card-head"><h2>Order preview</h2><button id="cancel-preview" class="small-button" type="button">Dismiss</button></div>
+      <div id="preview-content"></div>
+      <p id="preview-warning" class="warning"></p>
+      <button id="execute-order" class="primary" type="button">Confirm and submit</button>
+    </section>
+
+    <template>
       <aside class="stack left-column">
         <section class="card">
           <div class="card-head"><h2>Dhan connection</h2></div>
@@ -271,7 +550,7 @@
           <button id="execute-order" class="primary" type="button">Confirm and submit</button>
         </section>
       </div>
-    </div>
+    </template>
     <p class="footer">Local dashboard · Market data and live orders require a valid Dhan account and token. Trading involves risk.</p>
   </main>
   <script src="/app.js" defer></script>

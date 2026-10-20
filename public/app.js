@@ -7,6 +7,7 @@ let currentMode = 'PAPER';
 let connected = false;
 let scannerRefreshInFlight = false;
 let autoTradeEnabled = false;
+let maxOpenTrades = 5;
 let latestScannerResults = [];
 let scannerRenderSignature = '';
 
@@ -48,15 +49,19 @@ function escapeHtml(value) {
   })[character]);
 }
 
-function setConnected(value, profile) {
+function setConnected(value, profile, tokenRenewal) {
   connected = value;
   const status = $('#connection-status');
   status.classList.toggle('connected', connected);
   status.lastElementChild.textContent = connected ? `Connected${profile?.name ? ` · ${profile.name}` : ''}` : 'Not connected';
   $('#disconnect-button').classList.toggle('hidden', !connected);
+  const form = $('#connect-form');
+  form.querySelectorAll('label, button[type="submit"]').forEach((element) => {
+    element.classList.toggle('hidden', connected);
+  });
   $('#connection-info').textContent = connected
-    ? `Client ID ${profile?.clientId || ''}. Credentials remain in server memory only.`
-    : 'Credentials are sent only to this local server and held in memory.';
+    ? `Client ID ${profile?.clientId || ''}. ${tokenRenewal?.message || 'Credentials remain on this computer.'}`
+    : 'Credentials are sent only to this local server.';
 }
 
 async function refreshConnection() {
@@ -64,11 +69,12 @@ async function refreshConnection() {
   currentMode = connection.mode || 'PAPER';
   $('#mode-select').value = currentMode;
   $('#positions-mode').textContent = currentMode === 'PAPER' ? 'Paper positions' : 'Broker positions';
-  setConnected(connection.connected, connection.profile);
+  setConnected(connection.connected, connection.profile, connection.tokenRenewal);
   const settings = connection.settings || {};
   const form = $('#trade-settings');
   form.elements.lots.value = settings.lotSize ?? 1;
   form.elements.maxTrades.value = settings.maxTrades ?? 5;
+  maxOpenTrades = settings.maxTrades ?? 5;
   autoTradeEnabled = Boolean(connection.autoTrade);
   form.elements.autoTrade.checked = Boolean(connection.autoTrade);
   $('#trade-mode-label').textContent = connection.autoTrade ? 'Auto trade' : 'Manual confirmation';
@@ -84,6 +90,7 @@ function renderScanner(results = []) {
   const body = $('#scanner-body');
   const search = ($('#scanner-filter')?.value || '').trim().toUpperCase();
   const visibleResults = search ? results.filter((row) => row.symbol.includes(search)) : results;
+  renderSignalCards(visibleResults.filter((row) => ['BUY', 'SELL'].includes(row.signal)));
   if (!visibleResults.length) {
     scannerRenderSignature = '';
     body.innerHTML = `<tr><td colspan="10" class="empty">${connected ? 'No scanner data returned.' : 'Connect Dhan to see scanner results.'}</td></tr>`;
@@ -129,8 +136,40 @@ function renderScanner(results = []) {
   }
 }
 
+function renderSignalCards(signals) {
+  const container = $('#signal-cards');
+  if (!connected) {
+    container.innerHTML = '<p class="note">Connect Dhan to see current signals.</p>';
+    return;
+  }
+  if (!signals.length) {
+    container.innerHTML = '<p class="note">No confirmed signals right now. The scanner is watching all liquid stocks.</p>';
+    return;
+  }
+  container.innerHTML = signals.slice(0, 8).map((row) => {
+    const bullish = row.signal === 'BUY';
+    const cprWidth = Number(row.cpr?.widthPct);
+    const cprText = Number.isFinite(cprWidth) ? `${cprWidth.toFixed(2)}%` : 'Unavailable';
+    const vwapText = formatPrice(row.vwap);
+    const cprRange = row.cpr
+      ? `${formatPrice(row.cpr.top)} / ${formatPrice(row.cpr.bottom)}`
+      : 'Unavailable';
+    return `<article class="signal-card ${bullish ? 'buy' : 'sell'}">
+      <div class="signal-title"><strong>${escapeHtml(row.symbol)}</strong><span>${formatPrice(row.price)}</span></div>
+      <p class="note">${bullish ? 'Bullish: sell a put' : 'Bearish: sell a call'}</p>
+      <div class="signal-data">
+        <div>VWAP<b>${vwapText}</b></div><div>CPR width<b>${cprText}</b></div>
+        <div>EMA 21 / 34<b>${formatPrice(row.ema21)} / ${formatPrice(row.ema34)}</b></div>
+        <div>Turnover today<b>${(Number(row.turnover || 0) / 10000000).toFixed(1)} Cr</b></div>
+        <div>CPR top / bottom<b>${cprRange}</b></div><div>Setup<b>${escapeHtml(row.setup || 'WAIT')}</b></div>
+      </div>
+      <button class="small-button primary preview-button" data-symbol="${escapeHtml(row.symbol)}" data-signal="${escapeHtml(row.signal)}" type="button">Preview order</button>
+    </article>`;
+  }).join('');
+}
+
 function renderPositions(positions = []) {
-  $('#position-count').textContent = `${positions.length} / 5`;
+  $('#position-count').textContent = `${positions.length} / ${maxOpenTrades}`;
   const body = $('#positions-body');
   if (!positions.length) {
     body.innerHTML = `<tr><td colspan="8" class="empty">${currentMode === 'PAPER' ? 'No open paper positions.' : 'No open broker positions.'}</td></tr>`;
@@ -187,6 +226,41 @@ function formValues(form) {
   return Object.fromEntries(new FormData(form).entries());
 }
 
+function updateSessionClock() {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Asia/Kolkata',
+    weekday: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23'
+  }).formatToParts(new Date());
+  const values = Object.fromEntries(parts.map(({ type, value }) => [type, value]));
+  const hour = Number(values.hour);
+  const minute = Number(values.minute);
+  const second = Number(values.second);
+  const minuteOfDay = hour * 60 + minute;
+  const elapsed = (minute % 15) * 60 + second;
+  const remaining = 900 - elapsed;
+  const minutesLeft = Math.floor(remaining / 60);
+  const secondsLeft = remaining % 60;
+  $('#candle-countdown').textContent = `${String(minutesLeft).padStart(2, '0')}:${String(secondsLeft).padStart(2, '0')}`;
+  $('.countdown .progress').style.strokeDashoffset = String(377 * (1 - elapsed / 900));
+
+  const isWeekday = !['Sat', 'Sun'].includes(values.weekday);
+  const entriesOpen = isWeekday && minuteOfDay >= 585 && minuteOfDay < 840;
+  const entriesUpcoming = isWeekday && minuteOfDay < 585;
+  const managing = isWeekday && minuteOfDay >= 840 && minuteOfDay < 915;
+  $('#entry-state').textContent = entriesOpen ? 'Open' : entriesUpcoming ? 'Soon' : managing ? 'Manage' : 'Closed';
+  $('#market-headline').textContent = entriesOpen
+    ? 'New entries are open'
+    : entriesUpcoming
+      ? 'New entries start at 09:45'
+      : managing
+        ? 'Manage open positions'
+        : 'Market is closed';
+}
+
 $('#connect-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   const form = event.currentTarget;
@@ -196,7 +270,7 @@ $('#connect-form').addEventListener('submit', async (event) => {
   try {
     const data = await api('/api/connect', { method: 'POST', body: JSON.stringify(fields) });
     form.elements.accessToken.value = '';
-    setConnected(true, data.profile);
+    setConnected(true, data.profile, data.tokenRenewal);
     showNotice(data.message || 'Connected to Dhan.', 'success');
     await refreshConnection();
     await refreshScanner();
@@ -257,6 +331,7 @@ $('#trade-settings').addEventListener('submit', async (event) => {
   try {
     const data = await api('/api/auto-trade', { method: 'POST', body: JSON.stringify(payload) });
     autoTradeEnabled = data.enabled;
+    maxOpenTrades = data.settings.maxTrades;
     $('#trade-mode-label').textContent = data.enabled ? 'Auto trade' : 'Manual confirmation';
     if (data.enabled) {
       $('#scan-auto-refresh').checked = true;
@@ -272,6 +347,14 @@ $('#trade-settings').addEventListener('submit', async (event) => {
 });
 
 $('#scanner-body').addEventListener('click', async (event) => {
+  await handlePreviewClick(event);
+});
+
+$('#signal-cards').addEventListener('click', async (event) => {
+  await handlePreviewClick(event);
+});
+
+async function handlePreviewClick(event) {
   const button = event.target.closest('.preview-button');
   if (!button) return;
   button.disabled = true;
@@ -299,7 +382,7 @@ $('#scanner-body').addEventListener('click', async (event) => {
   } finally {
     button.disabled = false;
   }
-});
+}
 
 $('#execute-order').addEventListener('click', async () => {
   if (!activePreviewId) return;
@@ -359,6 +442,8 @@ async function initialize() {
 }
 
 initialize();
+updateSessionClock();
+window.setInterval(updateSessionClock, 1000);
 window.setInterval(() => {
   if (connected && $('#scan-auto-refresh').checked) refreshScanner(false).catch(() => {});
 }, 1000);
