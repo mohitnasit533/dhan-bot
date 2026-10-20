@@ -41,8 +41,8 @@ function updateAutoTradeAvailability() {
         ? `Auto trade is locked until these controls are saved: ${missing}.`
       : paperMode && !connected
         ? autoTradeEnabled
-          ? 'Paper Auto trade is enabled, but needs verified Dhan market data before it can scan and simulate trades. No real orders can be placed in Paper mode.'
-          : 'Paper Auto trade can be enabled without connecting a broker. Verified Dhan market data is still required for scanner signals; no simulated trades run until data is available.'
+          ? 'Paper Auto trade is enabled, but needs a verified Dhan API connection for market data before it can scan and simulate trades. No real orders can be placed in Paper mode.'
+          : 'Paper Auto trade can be enabled without authorizing live orders. A verified Dhan API connection is still required for scanner data; no simulated trades run until data is available.'
       : !connected
         ? 'Live Auto trade is locked until this server verifies your Dhan profile.'
       : paperMode
