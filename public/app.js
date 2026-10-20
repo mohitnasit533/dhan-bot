@@ -23,31 +23,29 @@ function showNotice(message, kind = '') {
 function updateAutoTradeAvailability() {
   const toggle = $('#auto-trade-toggle');
   const paperMode = currentMode === 'PAPER';
-  const ready = riskSettingsReady && (paperMode || connected);
+  const ready = paperMode || (connected && riskSettingsReady);
   const missing = missingRiskSettings.length
       ? missingRiskSettings.join(', ')
       : 'daily max loss, stop loss, and profit target';
   toggle.disabled = !ready && !autoTradeEnabled;
   toggle.title = ready
       ? paperMode
-        ? 'Automatically simulate confirmed signals. No broker orders are placed.'
+        ? riskSettingsReady
+          ? 'Automatically simulate confirmed signals. Dhan data and saved risk settings are required before paper entries.'
+          : 'Enable Paper Auto scan. Simulated entries remain blocked until risk limits are saved.'
         : 'Automatically enter confirmed signals. Live mode can place real orders.'
-      : !riskSettingsReady
-        ? `Save positive risk values before enabling Auto trade: ${missing}.`
-        : !connected
-        ? 'Connect and verify Dhan before enabling automatic signal handling.'
-        : '';
-  $('#auto-trade-readiness').textContent = !riskSettingsReady
-        ? `Auto trade is locked until these controls are saved: ${missing}.`
+        : `Connect and verify Dhan before enabling Live Auto trade; save positive risk values: ${missing}.`;
+  $('#auto-trade-readiness').textContent = paperMode && !riskSettingsReady
+      ? `Paper Auto can be toggled, but simulated entries are blocked until these controls are saved: ${missing}.`
       : paperMode && !connected
         ? autoTradeEnabled
-          ? 'Paper Auto trade is enabled, but needs a verified Dhan API connection for market data before it can scan and simulate trades. No real orders can be placed in Paper mode.'
-          : 'Paper Auto trade can be enabled without authorizing live orders. A verified Dhan API connection is still required for scanner data; no simulated trades run until data is available.'
-      : !connected
+          ? 'Paper Auto trade is enabled and waiting for a verified Dhan API data connection. No real orders can be placed in Paper mode.'
+          : 'Paper Auto trade needs a verified Dhan API data connection to scan signals. It never submits broker orders.'
+        : !connected
         ? 'Live Auto trade is locked until this server verifies your Dhan profile.'
       : paperMode
         ? 'Ready. Paper mode simulates confirmed signals and never submits broker orders.'
-      : 'Ready. Paper mode simulates signals; Live mode can submit real Dhan orders without per-order confirmation.';
+        : 'Ready. Live Auto can submit real Dhan orders without per-order confirmation.';
 }
 
 function updateScanIndicator(busy = false) {

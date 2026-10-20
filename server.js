@@ -330,6 +330,7 @@ function syncPaperTrades(optionQuotes) {
 
 async function runPaperAutoTrades(results) {
   if (!isEntryWindowOpen()) return;
+  if (missingRiskSettings(autoTradeConfig.settings).length) return;
 
   for (const result of results) {
     if (!autoTradeConfig.enabled) return;
@@ -702,6 +703,12 @@ app.post('/api/mode', async (req, res) => {
   if (mode !== 'PAPER' && mode !== 'LIVE') {
     return res.status(400).json({ ok: false, message: 'Mode must be PAPER or LIVE.' });
   }
+  if (mode === 'LIVE' && autoTradeConfig.enabled) {
+    const missing = missingRiskSettings(autoTradeConfig.settings);
+    if (missing.length) {
+      return res.status(409).json({ ok: false, message: `Configure these trade controls before switching Auto trade to Live: ${missing.join(', ')}.` });
+    }
+  }
   if (mode === 'LIVE' && !dhan.getConnection()) {
     return res.status(409).json({ ok: false, message: 'Connect and verify your Dhan account before enabling Live mode.' });
   }
@@ -739,6 +746,7 @@ app.get('/api/account', async (req, res) => {
 app.get('/api/scanner', async (req, res) => {
   if (!dhan.getConnection()) {
     const paperAutoWaiting = tradingMode === 'PAPER' && autoTradeConfig.enabled;
+    const paperMissingRisk = paperAutoWaiting ? missingRiskSettings(autoTradeConfig.settings) : [];
     return res.json({
       ok: true,
       connected: false,
@@ -748,12 +756,14 @@ app.get('/api/scanner', async (req, res) => {
       activePositions: getActiveTradesList(),
       brokerPositions: [],
       message: paperAutoWaiting
-        ? 'Paper Auto trade is enabled and waiting for verified market data. No simulated trades can open until scanner data is available.'
+        ? `Paper Auto trade is enabled and waiting for verified Dhan market data${paperMissingRisk.length ? ` and saved risk controls (${paperMissingRisk.join(', ')})` : ''}. No simulated trades can open yet.`
         : 'Connect Dhan to load live market data.',
       autoTrade: {
         enabled: autoTradeConfig.enabled,
         mode: tradingMode,
-        status: paperAutoWaiting ? 'paper_waiting_for_market_data' : 'ready',
+        status: paperAutoWaiting
+          ? paperMissingRisk.length ? 'paper_waiting_for_risk_and_market_data' : 'paper_waiting_for_market_data'
+          : 'ready',
         lastError: autoTradeConfig.lastError || null
       }
     });
@@ -783,7 +793,11 @@ app.get('/api/scanner', async (req, res) => {
       autoTrade: {
         enabled: autoTradeConfig.enabled,
         mode: tradingMode,
-        status: autoTradeConfig.enabled && tradingMode === 'LIVE' ? 'live_auto_enabled' : 'ready',
+        status: autoTradeConfig.enabled && tradingMode === 'LIVE'
+          ? 'live_auto_enabled'
+          : autoTradeConfig.enabled && missingRiskSettings(autoTradeConfig.settings).length
+            ? 'paper_waiting_for_risk_settings'
+            : 'ready',
         lastError: autoTradeConfig.lastError || null
       }
     });
@@ -1120,7 +1134,7 @@ app.post('/api/auto-trade', async (req, res) => {
   let settings;
   try {
     settings = validateTradeSettings(req.body || {}, autoTradeConfig.settings);
-    if (enabled) {
+    if (enabled && tradingMode === 'LIVE') {
       const missing = missingRiskSettings(settings);
       if (missing.length) throw new Error(`Configure these trade controls before enabling Auto trade: ${missing.join(', ')}.`);
     }
@@ -1151,9 +1165,11 @@ app.post('/api/auto-trade', async (req, res) => {
     message: !enabled
       ? `Manual mode enabled. Choose a signal and preview each entry.${liveSubmissionInProgress ? ' A live order was already being submitted; check Dhan for its latest status.' : ''}`
       : tradingMode === 'PAPER'
-          ? dhan.getConnection()
-            ? 'Paper Auto trade enabled. Confirmed signals open simulated positions; no broker orders are placed.'
-            : 'Paper Auto trade enabled. Connect Dhan to provide market data; no simulated trades can open until scanner data is available.'
+          ? missingRiskSettings(settings).length
+            ? `Paper Auto trade enabled. Simulated entries are blocked until these controls are saved: ${missingRiskSettings(settings).join(', ')}. No broker orders are placed.`
+            : dhan.getConnection()
+              ? 'Paper Auto trade enabled. Confirmed signals open simulated positions; no broker orders are placed.'
+              : 'Paper Auto trade enabled. Connect Dhan for market data before simulated entries can open; no broker orders are placed.'
           : 'Live auto mode enabled. The server checks positions and active orders before each automatic stock-option entry.'
   });
 });
