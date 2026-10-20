@@ -5,7 +5,7 @@ const assert = require('node:assert/strict');
 const {
   calculatePreviousDayCpr,
   confirmedSignal,
-  getGapDownSetup,
+  getOpeningGapSetup,
   optionTargetForSignal,
   calculateShortOptionRisk,
   chooseOptionExpiry,
@@ -36,13 +36,17 @@ function intradayCandle(date, minute, open, high, low, close) {
   };
 }
 
-function gapDownCandles(openingClose, confirmationClose) {
+function openingGapCandles(openingPrice, todayCloses) {
   const candles = Array.from({ length: 40 }, (_, index) =>
     intradayCandle('2026-10-20', index * 15, 100, 100, 100, 100));
-  candles.push(intradayCandle('2026-10-21', 0, 97, 100, 96, openingClose));
-  if (confirmationClose !== undefined) {
-    candles.push(intradayCandle('2026-10-21', 15, openingClose, 100.2, 96, confirmationClose));
-  }
+  todayCloses.forEach((close, index) => candles.push(intradayCandle(
+    '2026-10-21',
+    index * 15,
+    index === 0 ? openingPrice : todayCloses[index - 1],
+    Math.max(openingPrice, close, 100),
+    Math.min(openingPrice, close, 96),
+    close
+  )));
   return candles;
 }
 
@@ -92,33 +96,53 @@ test('sells puts at positive-signal delta -0.40 and calls at negative-signal del
   assert.throws(() => optionTargetForSignal('WATCH'), /confirmed BUY or SELL/);
 });
 
-test('gap-down setup waits for the EMA band candle then confirms above or below EMA 21', () => {
-  const wait = getGapDownSetup(gapDownCandles(97, undefined), new Date('2026-10-21T06:00:00Z'));
-  const bullishBreak = getGapDownSetup(gapDownCandles(100, 100.2), new Date('2026-10-21T06:00:00Z'));
-  const bearishBreak = getGapDownSetup(gapDownCandles(100, 99.8), new Date('2026-10-21T06:00:00Z'));
+test('gap-down waits for EMA band, then an above-EMA close, then a return below EMA 21 to confirm SELL CALL', () => {
+  const date = new Date('2026-10-21T06:00:00Z');
+  const waitingForBand = getOpeningGapSetup(openingGapCandles(97, [97]), date);
+  const waitingForAbove = getOpeningGapSetup(openingGapCandles(97, [97, 99.8]), date);
+  const aboveDoesNotTrade = getOpeningGapSetup(openingGapCandles(97, [97, 99.8, 100]), date);
+  const returnBelow = getOpeningGapSetup(openingGapCandles(97, [97, 99.8, 100, 99]), date);
 
-  assert.equal(wait.status, 'WAITING_FOR_EMA_BAND');
-  assert.equal(bullishBreak.status, 'CONFIRMED');
-  assert.equal(bullishBreak.signal, 'BUY');
-  assert.equal(bearishBreak.status, 'CONFIRMED');
-  assert.equal(bearishBreak.signal, 'SELL');
+  assert.equal(waitingForBand.status, 'WAITING_FOR_EMA_BAND');
+  assert.equal(waitingForAbove.status, 'WAITING_FOR_EMA21_BREAK');
+  assert.equal(aboveDoesNotTrade.status, 'WAITING_FOR_RETURN_BELOW_EMA21');
+  assert.equal(aboveDoesNotTrade.signal, 'WATCH');
+  assert.equal(returnBelow.status, 'CONFIRMED');
+  assert.equal(returnBelow.signal, 'SELL');
+  assert.equal(returnBelow.direction, 'DOWN');
 });
 
-test('gap-down setup requires a 3% opening gap below the previous close', () => {
-  const belowThreshold = gapDownCandles(97, undefined);
-  belowThreshold[40].open = 98;
+test('gap-up waits for an EMA-band candle then confirms BUY / SELL PUT above EMA 21', () => {
+  const date = new Date('2026-10-21T06:00:00Z');
+  const waitingForBand = getOpeningGapSetup(openingGapCandles(103, [103]), date);
+  const waitingForAbove = getOpeningGapSetup(openingGapCandles(103, [103, 100.2]), date);
+  const confirmed = getOpeningGapSetup(openingGapCandles(103, [103, 100.2, 100.3]), date);
 
+  assert.equal(waitingForBand.status, 'WAITING_FOR_EMA_BAND');
+  assert.equal(waitingForAbove.status, 'WAITING_FOR_EMA21_BREAK');
+  assert.equal(confirmed.status, 'CONFIRMED');
+  assert.equal(confirmed.signal, 'BUY');
+  assert.equal(confirmed.direction, 'UP');
+});
+
+test('opening-gap setup requires a 3% gap in either direction', () => {
+  const date = new Date('2026-10-21T06:00:00Z');
+  const belowThreshold = openingGapCandles(97.01, [97]);
+  const gapUpBelowThreshold = openingGapCandles(102.99, [103]);
   assert.deepEqual(
-    getGapDownSetup(belowThreshold, new Date('2026-10-21T06:00:00Z')),
+    getOpeningGapSetup(belowThreshold, date),
+    { active: false, status: 'NO_GAP', signal: 'WATCH' }
+  );
+  assert.deepEqual(
+    getOpeningGapSetup(gapUpBelowThreshold, date),
     { active: false, status: 'NO_GAP', signal: 'WATCH' }
   );
 });
 
-test('a gap-down break signal only fires on the first confirmation candle', () => {
-  const candles = gapDownCandles(100, 100.2);
-  candles.push(intradayCandle('2026-10-21', 30, 100.2, 100.3, 100.1, 100.25));
+test('opening-gap confirmation only fires on the current last candle', () => {
+  const candles = openingGapCandles(103, [103, 100.2, 100.3, 100.4]);
 
-  const setup = getGapDownSetup(candles, new Date('2026-10-21T06:00:00Z'));
+  const setup = getOpeningGapSetup(candles, new Date('2026-10-21T06:00:00Z'));
   assert.equal(setup.status, 'SETUP_EXPIRED');
   assert.equal(setup.signal, 'WATCH');
 });

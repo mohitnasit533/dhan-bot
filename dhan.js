@@ -630,7 +630,7 @@ function confirmedSignal({ crossedUp, crossedDown, trend, close, vwap, cpr }) {
   return 'WATCH';
 }
 
-function getGapDownSetup(candles, date = new Date()) {
+function getOpeningGapSetup(candles, date = new Date()) {
   if (candles.length < 35) return { active: false, status: 'UNAVAILABLE', signal: 'WATCH' };
   const today = istDate(date);
   const todayIndices = candles.map((candle, index) => ({ candle, index }))
@@ -654,8 +654,11 @@ function getGapDownSetup(candles, date = new Date()) {
   if (!Number.isFinite(previousClose) || previousClose <= 0) {
     return { active: false, status: 'NO_GAP', signal: 'WATCH' };
   }
-  const gapPct = ((previousClose - firstToday.candle.open) / previousClose) * 100;
-  if (!Number.isFinite(gapPct) || gapPct < 3) return { active: false, status: 'NO_GAP', signal: 'WATCH' };
+  const gapPct = ((firstToday.candle.open - previousClose) / previousClose) * 100;
+  if (!Number.isFinite(gapPct) || Math.abs(gapPct) < 3) {
+    return { active: false, status: 'NO_GAP', signal: 'WATCH' };
+  }
+  const gapDirection = gapPct > 0 ? 'UP' : 'DOWN';
 
   const closes = candles.map((candle) => candle.close);
   const ema21 = emaSeries(closes, 21);
@@ -667,23 +670,55 @@ function getGapDownSetup(candles, date = new Date()) {
     return candle.close >= Math.min(ema21Value, ema34Value)
       && candle.close <= Math.max(ema21Value, ema34Value);
   });
-  if (!bandCandle) return { active: true, status: 'WAITING_FOR_EMA_BAND', signal: 'WATCH', gapPct };
-
-  const confirmation = todayIndices.find(({ candle, index }) => {
-    if (index <= bandCandle.index || index < 33) return false;
-    const ema21Value = ema21[index - 20];
-    return candle.close > ema21Value || candle.close < ema21Value;
-  });
-  if (!confirmation) return { active: true, status: 'WAITING_FOR_EMA21_BREAK', signal: 'WATCH', gapPct };
-  if (confirmation.index !== candles.length - 1) {
-    return { active: true, status: 'SETUP_EXPIRED', signal: 'WATCH', gapPct };
+  if (!bandCandle) {
+    return { active: true, direction: gapDirection, status: 'WAITING_FOR_EMA_BAND', signal: 'WATCH', gapPct: Math.abs(gapPct) };
   }
-  const confirmationEma21 = ema21[confirmation.index - 20];
+
+  let sawCloseAboveEma21 = false;
+  let confirmation = null;
+  for (const item of todayIndices) {
+    const { candle, index } = item;
+    if (index <= bandCandle.index || index < 33) continue;
+    const ema21Value = ema21[index - 20];
+    if (gapDirection === 'UP' && candle.close > ema21Value) {
+      confirmation = { ...item, signal: 'BUY' };
+      break;
+    }
+    if (gapDirection === 'DOWN') {
+      if (candle.close > ema21Value) {
+        sawCloseAboveEma21 = true;
+      } else if (sawCloseAboveEma21 && candle.close < ema21Value) {
+        confirmation = { ...item, signal: 'SELL' };
+        break;
+      }
+    }
+  }
+  if (!confirmation) {
+    return {
+      active: true,
+      direction: gapDirection,
+      status: gapDirection === 'DOWN' && sawCloseAboveEma21
+        ? 'WAITING_FOR_RETURN_BELOW_EMA21'
+        : 'WAITING_FOR_EMA21_BREAK',
+      signal: 'WATCH',
+      gapPct: Math.abs(gapPct)
+    };
+  }
+  if (confirmation.index !== candles.length - 1) {
+    return {
+      active: true,
+      direction: gapDirection,
+      status: 'SETUP_EXPIRED',
+      signal: 'WATCH',
+      gapPct: Math.abs(gapPct)
+    };
+  }
   return {
     active: true,
+    direction: gapDirection,
     status: 'CONFIRMED',
-    signal: confirmation.candle.close > confirmationEma21 ? 'BUY' : 'SELL',
-    gapPct
+    signal: confirmation.signal,
+    gapPct: Math.abs(gapPct)
   };
 }
 
@@ -735,7 +770,7 @@ function calculateIndicators(candles) {
     vwap,
     cpr
   });
-  const gapSetup = getGapDownSetup(candles);
+  const gapSetup = getOpeningGapSetup(candles);
   const signal = gapSetup.active
     ? gapSetup.status === 'CONFIRMED' && gapSetup.signal === confirmed ? confirmed : 'WATCH'
     : confirmed;
@@ -809,12 +844,14 @@ async function getLiveScan(optionSecurityIds = []) {
       setup: indicators?.signal === 'BUY' ? 'SELL PUT' : indicators?.signal === 'SELL' ? 'SELL CALL'
         : indicators?.gapSetup?.active
           ? indicators.gapSetup.status === 'WAITING_FOR_EMA_BAND'
-            ? `GAP DOWN ${indicators.gapSetup.gapPct.toFixed(1)}% · WAIT EMA BAND`
-            : indicators.gapSetup.status === 'WAITING_FOR_EMA21_BREAK'
-              ? `GAP DOWN ${indicators.gapSetup.gapPct.toFixed(1)}% · WAIT EMA21 BREAK`
-              : indicators.gapSetup.status === 'SETUP_EXPIRED'
-                ? 'GAP DOWN · WAIT NEXT SETUP'
-              : 'GAP DOWN · WAIT FULL CONFIRMATION'
+            ? `GAP ${indicators.gapSetup.direction} ${indicators.gapSetup.gapPct.toFixed(1)}% · WAIT EMA BAND`
+            : indicators.gapSetup.status === 'WAITING_FOR_RETURN_BELOW_EMA21'
+              ? `GAP DOWN ${indicators.gapSetup.gapPct.toFixed(1)}% · WAIT RETURN BELOW EMA21`
+              : indicators.gapSetup.status === 'WAITING_FOR_EMA21_BREAK'
+                ? `GAP ${indicators.gapSetup.direction} ${indicators.gapSetup.gapPct.toFixed(1)}% · WAIT EMA21 BREAK`
+                : indicators.gapSetup.status === 'SETUP_EXPIRED'
+                  ? `GAP ${indicators.gapSetup.direction} · WAIT NEXT SETUP`
+                  : `GAP ${indicators.gapSetup.direction} · WAIT FULL CONFIRMATION`
           : 'WAIT',
       lastCandleAt: indicators?.lastCandleAt || null,
       dataError: !Number.isFinite(price) || price <= 0 ? 'Current cash quote unavailable' : dataError,
@@ -848,7 +885,7 @@ module.exports = {
   requireConnection,
   chooseOptionExpiry,
   optionTargetForSignal,
-  getGapDownSetup,
+  getOpeningGapSetup,
   rankLiquidInstruments,
   deriveFnoEquityInstruments,
   istDate,
