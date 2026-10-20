@@ -738,7 +738,25 @@ app.get('/api/account', async (req, res) => {
 
 app.get('/api/scanner', async (req, res) => {
   if (!dhan.getConnection()) {
-    return res.json({ ok: true, connected: false, mode: tradingMode, liveData: false, results: [], activePositions: [], brokerPositions: [], message: 'Connect Dhan to load live market data.' });
+    const paperAutoWaiting = tradingMode === 'PAPER' && autoTradeConfig.enabled;
+    return res.json({
+      ok: true,
+      connected: false,
+      mode: tradingMode,
+      liveData: false,
+      results: [],
+      activePositions: getActiveTradesList(),
+      brokerPositions: [],
+      message: paperAutoWaiting
+        ? 'Paper Auto trade is enabled and waiting for verified market data. No simulated trades can open until scanner data is available.'
+        : 'Connect Dhan to load live market data.',
+      autoTrade: {
+        enabled: autoTradeConfig.enabled,
+        mode: tradingMode,
+        status: paperAutoWaiting ? 'paper_waiting_for_market_data' : 'ready',
+        lastError: autoTradeConfig.lastError || null
+      }
+    });
   }
 
   try {
@@ -1089,10 +1107,10 @@ app.post('/api/auto-trade', async (req, res) => {
   if (typeof enabled !== 'boolean') {
     return res.status(400).json({ ok: false, message: 'Choose Manual or Auto mode.' });
   }
-  if (enabled && !dhan.getConnection()) {
-    return res.status(401).json({ ok: false, message: 'Connect Dhan before enabling automatic signal handling.' });
+  if (enabled && tradingMode === 'LIVE' && !dhan.getConnection()) {
+    return res.status(401).json({ ok: false, message: 'Connect Dhan before enabling Live Auto trade.' });
   }
-  if (enabled) {
+  if (enabled && tradingMode === 'LIVE') {
     try {
       await dhan.verifyConnection();
     } catch (error) {
@@ -1133,7 +1151,9 @@ app.post('/api/auto-trade', async (req, res) => {
     message: !enabled
       ? `Manual mode enabled. Choose a signal and preview each entry.${liveSubmissionInProgress ? ' A live order was already being submitted; check Dhan for its latest status.' : ''}`
       : tradingMode === 'PAPER'
-        ? 'Auto mode enabled. Confirmed signals open simulated Paper positions automatically.'
+          ? dhan.getConnection()
+            ? 'Paper Auto trade enabled. Confirmed signals open simulated positions; no broker orders are placed.'
+            : 'Paper Auto trade enabled. Connect Dhan to provide market data; no simulated trades can open until scanner data is available.'
           : 'Live auto mode enabled. The server checks positions and active orders before each automatic stock-option entry.'
   });
 });
