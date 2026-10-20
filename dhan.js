@@ -218,6 +218,12 @@ function chooseOptionExpiry(expiries, today = new Date()) {
   return monthlyExpiries.find((value) => value.slice(0, 7) > currentMonth && value >= todayDate) || null;
 }
 
+function optionTargetForSignal(signal) {
+  if (signal === 'BUY') return { option: 'pe', delta: -0.4 };
+  if (signal === 'SELL') return { option: 'ce', delta: 0.4 };
+  throw new Error('Choose a confirmed BUY or SELL signal to select an option.');
+}
+
 function meetsOptionLiquidity(contract, settings = {}) {
   const oi = Number(contract?.oi ?? contract?.open_interest);
   const bid = Number(contract?.top_bid_price);
@@ -255,8 +261,7 @@ async function getOptionData(underlying, signal, liquiditySettings = {}) {
   });
 
   const chain = chainResult.data || {};
-  const desiredOption = signal === 'BUY' ? 'pe' : 'ce';
-  const desiredDelta = signal === 'BUY' ? -0.4 : 0.4;
+  const { option: desiredOption, delta: desiredDelta } = optionTargetForSignal(signal);
   const candidates = Object.entries(chain.oc || {}).map(([strikeText, legs]) => ({
     strike: Number(strikeText),
     contract: legs[desiredOption]
@@ -625,6 +630,63 @@ function confirmedSignal({ crossedUp, crossedDown, trend, close, vwap, cpr }) {
   return 'WATCH';
 }
 
+function getGapDownSetup(candles, date = new Date()) {
+  if (candles.length < 35) return { active: false, status: 'UNAVAILABLE', signal: 'WATCH' };
+  const today = istDate(date);
+  const todayIndices = candles.map((candle, index) => ({ candle, index }))
+    .filter(({ candle }) => dayInIndia(candle.timestamp) === today);
+  if (!todayIndices.length) return { active: false, status: 'NO_GAP', signal: 'WATCH' };
+
+  const firstToday = todayIndices[0];
+  let previousSession = null;
+  for (let index = firstToday.index - 1; index >= 0; index -= 1) {
+    const session = dayInIndia(candles[index].timestamp);
+    if (session !== today) {
+      previousSession = session;
+      break;
+    }
+  }
+  if (!previousSession) return { active: false, status: 'NO_GAP', signal: 'WATCH' };
+
+  const previousClose = candles.slice(0, firstToday.index)
+    .filter((candle) => dayInIndia(candle.timestamp) === previousSession)
+    .at(-1)?.close;
+  if (!Number.isFinite(previousClose) || previousClose <= 0) {
+    return { active: false, status: 'NO_GAP', signal: 'WATCH' };
+  }
+  const gapPct = ((previousClose - firstToday.candle.open) / previousClose) * 100;
+  if (!Number.isFinite(gapPct) || gapPct < 3) return { active: false, status: 'NO_GAP', signal: 'WATCH' };
+
+  const closes = candles.map((candle) => candle.close);
+  const ema21 = emaSeries(closes, 21);
+  const ema34 = emaSeries(closes, 34);
+  const bandCandle = todayIndices.find(({ candle, index }) => {
+    if (index < 33) return false;
+    const ema21Value = ema21[index - 20];
+    const ema34Value = ema34[index - 33];
+    return candle.close >= Math.min(ema21Value, ema34Value)
+      && candle.close <= Math.max(ema21Value, ema34Value);
+  });
+  if (!bandCandle) return { active: true, status: 'WAITING_FOR_EMA_BAND', signal: 'WATCH', gapPct };
+
+  const confirmation = todayIndices.find(({ candle, index }) => {
+    if (index <= bandCandle.index || index < 33) return false;
+    const ema21Value = ema21[index - 20];
+    return candle.close > ema21Value || candle.close < ema21Value;
+  });
+  if (!confirmation) return { active: true, status: 'WAITING_FOR_EMA21_BREAK', signal: 'WATCH', gapPct };
+  if (confirmation.index !== candles.length - 1) {
+    return { active: true, status: 'SETUP_EXPIRED', signal: 'WATCH', gapPct };
+  }
+  const confirmationEma21 = ema21[confirmation.index - 20];
+  return {
+    active: true,
+    status: 'CONFIRMED',
+    signal: confirmation.candle.close > confirmationEma21 ? 'BUY' : 'SELL',
+    gapPct
+  };
+}
+
 function calculateShortOptionRisk(entryPrice, tickSize, quantity, stopLossInr, targetInr) {
   quantity = Number(quantity);
   stopLossInr = Number(stopLossInr);
@@ -665,7 +727,7 @@ function calculateIndicators(candles) {
   const cpr = calculatePreviousDayCpr(candles);
   const crossedUp = ema21Previous <= ema34Previous && ema21Last > ema34Last;
   const crossedDown = ema21Previous >= ema34Previous && ema21Last < ema34Last;
-  const signal = confirmedSignal({
+  const confirmed = confirmedSignal({
     crossedUp,
     crossedDown,
     trend,
@@ -673,6 +735,10 @@ function calculateIndicators(candles) {
     vwap,
     cpr
   });
+  const gapSetup = getGapDownSetup(candles);
+  const signal = gapSetup.active
+    ? gapSetup.status === 'CONFIRMED' && gapSetup.signal === confirmed ? confirmed : 'WATCH'
+    : confirmed;
 
   return {
     ema21: ema21Last,
@@ -680,6 +746,7 @@ function calculateIndicators(candles) {
     vwap,
     trend,
     signal,
+    gapSetup,
     cpr,
     lastClose: last.close,
     lastCandleAt: new Date(last.timestamp * 1000).toISOString()
@@ -739,7 +806,16 @@ async function getLiveScan(optionSecurityIds = []) {
       supertrend: indicators?.trend || 'UNAVAILABLE',
       signal: candleAge < 15 * 60 * 1000 ? (indicators?.signal || 'WATCH') : 'WATCH',
       trend: indicators?.trend || 'Unavailable',
-      setup: indicators?.signal === 'BUY' ? 'SELL PUT' : indicators?.signal === 'SELL' ? 'SELL CALL' : 'WAIT',
+      setup: indicators?.signal === 'BUY' ? 'SELL PUT' : indicators?.signal === 'SELL' ? 'SELL CALL'
+        : indicators?.gapSetup?.active
+          ? indicators.gapSetup.status === 'WAITING_FOR_EMA_BAND'
+            ? `GAP DOWN ${indicators.gapSetup.gapPct.toFixed(1)}% · WAIT EMA BAND`
+            : indicators.gapSetup.status === 'WAITING_FOR_EMA21_BREAK'
+              ? `GAP DOWN ${indicators.gapSetup.gapPct.toFixed(1)}% · WAIT EMA21 BREAK`
+              : indicators.gapSetup.status === 'SETUP_EXPIRED'
+                ? 'GAP DOWN · WAIT NEXT SETUP'
+              : 'GAP DOWN · WAIT FULL CONFIRMATION'
+          : 'WAIT',
       lastCandleAt: indicators?.lastCandleAt || null,
       dataError: !Number.isFinite(price) || price <= 0 ? 'Current cash quote unavailable' : dataError,
       dataState: !Number.isFinite(price) || price <= 0 ? 'UNAVAILABLE' : !candleRecord ? 'LOADING' : candleAge >= 15 * 60 * 1000 ? 'REFRESHING' : indicators ? 'READY' : 'UNAVAILABLE'
@@ -771,6 +847,8 @@ module.exports = {
   placeSuperOrder,
   requireConnection,
   chooseOptionExpiry,
+  optionTargetForSignal,
+  getGapDownSetup,
   rankLiquidInstruments,
   deriveFnoEquityInstruments,
   istDate,

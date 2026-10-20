@@ -5,6 +5,8 @@ const assert = require('node:assert/strict');
 const {
   calculatePreviousDayCpr,
   confirmedSignal,
+  getGapDownSetup,
+  optionTargetForSignal,
   calculateShortOptionRisk,
   chooseOptionExpiry,
   rankLiquidInstruments,
@@ -21,6 +23,27 @@ function candle(date, high, low, close) {
     low,
     close
   };
+}
+
+function intradayCandle(date, minute, open, high, low, close) {
+  return {
+    timestamp: Math.floor(new Date(`${date}T09:15:00+05:30`).getTime() / 1000) + minute * 60,
+    open,
+    high,
+    low,
+    close,
+    volume: 1000
+  };
+}
+
+function gapDownCandles(openingClose, confirmationClose) {
+  const candles = Array.from({ length: 40 }, (_, index) =>
+    intradayCandle('2026-10-20', index * 15, 100, 100, 100, 100));
+  candles.push(intradayCandle('2026-10-21', 0, 97, 100, 96, openingClose));
+  if (confirmationClose !== undefined) {
+    candles.push(intradayCandle('2026-10-21', 15, openingClose, 100.2, 96, confirmationClose));
+  }
+  return candles;
 }
 
 test('calculates narrow CPR from the previous trading session', () => {
@@ -61,6 +84,43 @@ test('requires all bearish confirmation conditions', () => {
     vwap: 100,
     cpr: { narrow: true, top: 101, bottom: 99.5 }
   }), 'SELL');
+});
+
+test('sells puts at positive-signal delta -0.40 and calls at negative-signal delta +0.40', () => {
+  assert.deepEqual(optionTargetForSignal('BUY'), { option: 'pe', delta: -0.4 });
+  assert.deepEqual(optionTargetForSignal('SELL'), { option: 'ce', delta: 0.4 });
+  assert.throws(() => optionTargetForSignal('WATCH'), /confirmed BUY or SELL/);
+});
+
+test('gap-down setup waits for the EMA band candle then confirms above or below EMA 21', () => {
+  const wait = getGapDownSetup(gapDownCandles(97, undefined), new Date('2026-10-21T06:00:00Z'));
+  const bullishBreak = getGapDownSetup(gapDownCandles(100, 100.2), new Date('2026-10-21T06:00:00Z'));
+  const bearishBreak = getGapDownSetup(gapDownCandles(100, 99.8), new Date('2026-10-21T06:00:00Z'));
+
+  assert.equal(wait.status, 'WAITING_FOR_EMA_BAND');
+  assert.equal(bullishBreak.status, 'CONFIRMED');
+  assert.equal(bullishBreak.signal, 'BUY');
+  assert.equal(bearishBreak.status, 'CONFIRMED');
+  assert.equal(bearishBreak.signal, 'SELL');
+});
+
+test('gap-down setup requires a 3% opening gap below the previous close', () => {
+  const belowThreshold = gapDownCandles(97, undefined);
+  belowThreshold[40].open = 98;
+
+  assert.deepEqual(
+    getGapDownSetup(belowThreshold, new Date('2026-10-21T06:00:00Z')),
+    { active: false, status: 'NO_GAP', signal: 'WATCH' }
+  );
+});
+
+test('a gap-down break signal only fires on the first confirmation candle', () => {
+  const candles = gapDownCandles(100, 100.2);
+  candles.push(intradayCandle('2026-10-21', 30, 100.2, 100.3, 100.1, 100.25));
+
+  const setup = getGapDownSetup(candles, new Date('2026-10-21T06:00:00Z'));
+  assert.equal(setup.status, 'SETUP_EXPIRED');
+  assert.equal(setup.signal, 'WATCH');
 });
 
 test('calculates short-option stop and target from configured INR risk', () => {
