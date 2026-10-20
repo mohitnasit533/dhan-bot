@@ -67,3 +67,40 @@ test('does not replace the saved Dhan token when renewal fails', async () => {
     global.fetch = originalFetch;
   }
 });
+
+test('sets the chosen static IP through Dhan POST with the verified credentials', async () => {
+  const originalFetch = global.fetch;
+  const requests = [];
+  global.fetch = async (url, options = {}) => {
+    requests.push({ url, options });
+    if (url.endsWith('/profile')) {
+      return new Response(JSON.stringify({
+        data: { dhanClientId: '123456', dhanClientName: 'Test account' }
+      }), { status: 200 });
+    }
+    if (url.endsWith('/ip/setIP')) {
+      return new Response(JSON.stringify({ status: 'success' }), { status: 200 });
+    }
+    throw new Error(`Unexpected Dhan request: ${url}`);
+  };
+
+  try {
+    await dhan.connect('123456', 'original-access-token-123456');
+    await dhan.setStaticIp('203.0.113.10', 'SECONDARY');
+    const request = requests.find(({ url }) => url.endsWith('/ip/setIP'));
+    assert.equal(request.options.method, 'POST');
+    assert.equal(request.options.headers['access-token'], 'original-access-token-123456');
+    assert.equal(request.options.headers['client-id'], '123456');
+    assert.equal(request.options.headers.Accept, 'application/json');
+    assert.deepEqual(JSON.parse(request.options.body), {
+      dhanClientId: '123456',
+      ip: '203.0.113.10',
+      ipFlag: 'SECONDARY'
+    });
+    await assert.rejects(dhan.setStaticIp('not-an-ip', 'PRIMARY'), { statusCode: 400 });
+    await assert.rejects(dhan.setStaticIp('203.0.113.11', 'INVALID'), { statusCode: 400 });
+  } finally {
+    dhan.disconnect();
+    global.fetch = originalFetch;
+  }
+});

@@ -8,33 +8,79 @@ const {
   missingRiskSettings,
   calculatePaperDailyPnl,
   calculateBotLiveDailyPnl,
-  dailyLossReached
+  isSquareOffTime,
+  indiaMinuteOfDay
 } = require('../risk-controls');
 
-test('blank risk amounts remain unset and prevent trading readiness', () => {
+test('zero risk amounts disable price triggers without blocking trading readiness', () => {
   const settings = validateTradeSettings({
     ...DEFAULT_SETTINGS,
-    maxDailyLossInr: '',
-    stopLossInr: null,
-    targetInr: ''
+    riskUnit: 'PERCENT',
+    stopLossValue: 0,
+    targetValue: 0
   });
-  assert.equal(settings.maxDailyLossInr, null);
-  assert.ok(missingRiskSettings(settings).includes('Stop loss (INR per position)'));
-  assert.ok(missingRiskSettings(settings).includes('Profit target (INR per position)'));
-  assert.equal(dailyLossReached(-5000, null), false);
-  assert.equal(dailyLossReached(-5000, 5000), true);
+  assert.equal(settings.stopLossValue, 0);
+  assert.equal(settings.targetValue, 0);
+  assert.deepEqual(missingRiskSettings(settings), []);
 });
 
-test('rejects invalid optional INR controls and liquidity thresholds', () => {
+test('validates rupee and percentage exit controls', () => {
+  assert.deepEqual(validateTradeSettings({
+    ...DEFAULT_SETTINGS,
+    riskUnit: 'INR',
+    stopLossValue: 500,
+    targetValue: 1000
+  }), {
+    ...DEFAULT_SETTINGS,
+    riskUnit: 'INR',
+    stopLossValue: 500,
+    targetValue: 1000
+  });
+  assert.equal(validateTradeSettings({
+    ...DEFAULT_SETTINGS,
+    riskUnit: 'PERCENT',
+    stopLossValue: 20,
+    targetValue: 50
+  }).targetValue, 50);
+});
+
+test('migrates saved legacy INR risk settings without requiring daily max loss', () => {
+  const settings = validateTradeSettings({
+    lotSize: 2,
+    maxTrades: 3,
+    stopLossInr: 200,
+    targetInr: 300,
+    maxDailyLossInr: 1000,
+    minOpenInterest: 1000,
+    maxSpreadPct: 2
+  });
+  assert.equal(settings.riskUnit, 'INR');
+  assert.equal(settings.stopLossValue, 200);
+  assert.equal(settings.targetValue, 300);
+  assert.equal(Object.hasOwn(settings, 'maxDailyLossInr'), false);
+});
+
+test('rejects negative risk values, impossible percentage targets, and invalid liquidity filters', () => {
   for (const [field, value] of [
-    ['stopLossInr', 0],
-    ['targetInr', -1],
-    ['maxDailyLossInr', 'not a number'],
+    ['stopLossValue', -1],
+    ['targetValue', 'not a number'],
+    ['targetValue', 100],
     ['minOpenInterest', 0],
     ['maxSpreadPct', 101]
   ]) {
-    assert.throws(() => validateTradeSettings({ ...DEFAULT_SETTINGS, [field]: value }));
+    assert.throws(() => validateTradeSettings({
+      ...DEFAULT_SETTINGS,
+      riskUnit: field === 'targetValue' && value === 100 ? 'PERCENT' : 'INR',
+      [field]: value
+    }));
   }
+});
+
+test('schedules square-off at 14:58 India time on weekdays only', () => {
+  assert.equal(isSquareOffTime(new Date('2026-10-20T09:27:00Z')), false);
+  assert.equal(isSquareOffTime(new Date('2026-10-20T09:28:00Z')), true);
+  assert.equal(isSquareOffTime(new Date('2026-10-24T09:28:00Z')), false);
+  assert.equal(indiaMinuteOfDay(new Date('2026-10-20T09:29:00Z')), 14 * 60 + 59);
 });
 
 test('paper daily P&L combines current open and same-day closed positions', () => {

@@ -1,6 +1,7 @@
 'use strict';
 
 const { parse } = require('csv-parse/sync');
+const { isIP } = require('node:net');
 
 const API_BASE = 'https://api.dhan.co/v2';
 const SCRIP_MASTER_URL = 'https://images.dhan.co/api-data/api-scrip-master.csv';
@@ -197,6 +198,26 @@ async function getFunds() {
   return result.data || {};
 }
 
+async function setStaticIp(ip, ipFlag) {
+  requireConnection();
+  const normalizedIp = typeof ip === 'string' ? ip.trim() : '';
+  if (!isIP(normalizedIp)) {
+    const error = new Error('Enter a valid public IPv4 or IPv6 static IP address.');
+    error.statusCode = 400;
+    throw error;
+  }
+  if (!['PRIMARY', 'SECONDARY'].includes(ipFlag)) {
+    const error = new Error('Choose PRIMARY or SECONDARY for the Dhan static IP slot.');
+    error.statusCode = 400;
+    throw error;
+  }
+  return requestDhan('/ip/setIP', {
+    method: 'POST',
+    headers: { Accept: 'application/json' },
+    body: JSON.stringify({ dhanClientId: credentials.clientId, ip: normalizedIp, ipFlag })
+  });
+}
+
 function roundToTick(value, tickSize) {
   const tick = Number(tickSize) || 0.05;
   return Number((Math.round(Number(value) / tick) * tick).toFixed(2));
@@ -349,8 +370,12 @@ async function createOptionOrderPreview({ symbol, signal, lots, includeMargin = 
   const contract = await getOptionData(symbol, signal, riskSettings);
   const quantity = lots * contract.lotUnits;
   const { stopLossPrice, targetPrice } = calculateShortOptionRisk(
-    contract.entryPrice, contract.tickSize, quantity,
-    riskSettings.stopLossInr, riskSettings.targetInr
+    contract.entryPrice,
+    contract.tickSize,
+    quantity,
+    riskSettings.stopLossValue,
+    riskSettings.targetValue,
+    riskSettings.riskUnit
   );
 
   const order = {
@@ -372,7 +397,12 @@ async function createOptionOrderPreview({ symbol, signal, lots, includeMargin = 
 
   return {
     order,
-    risk: { stopLossInr: Number(riskSettings.stopLossInr), targetInr: Number(riskSettings.targetInr) },
+    tickSize: contract.tickSize,
+    risk: {
+      unit: riskSettings.riskUnit,
+      stopLossValue: riskSettings.stopLossValue,
+      targetValue: riskSettings.targetValue
+    },
     underlying: contract.underlying,
     signal,
     preview: {
@@ -388,8 +418,8 @@ async function createOptionOrderPreview({ symbol, signal, lots, includeMargin = 
       'Order notional': (quantity * contract.entryPrice).toFixed(2),
       'Open interest': contract.openInterest,
       'Bid/ask spread (%)': (((contract.askPrice - contract.bidPrice) / ((contract.askPrice + contract.bidPrice) / 2)) * 100).toFixed(2),
-      'Stop loss price': stopLossPrice,
-      'Target price': targetPrice,
+      'Stop loss price': stopLossPrice || 'Disabled (14:58 IST square-off)',
+      'Target price': targetPrice || 'Disabled (14:58 IST square-off)',
       'Estimated margin': margin.totalMargin ?? 'Unavailable',
       'Available funds': margin.availableFunds ?? 'Not checked',
       'Trailing stop': 'Not exchange-managed; live trailing activation is not enabled'
@@ -401,6 +431,24 @@ async function createOptionOrderPreview({ symbol, signal, lots, includeMargin = 
 async function placeSuperOrder(order) {
   requireConnection();
   return requestDhan('/super/orders', { method: 'POST', body: JSON.stringify(order) });
+}
+
+async function placeRegularOrder(order) {
+  requireConnection();
+  return requestDhan('/orders', { method: 'POST', body: JSON.stringify(order) });
+}
+
+async function cancelRegularOrder(orderId) {
+  requireConnection();
+  return requestDhan(`/orders/${encodeURIComponent(orderId)}`, { method: 'DELETE' });
+}
+
+async function cancelSuperOrderLeg(orderId, legName) {
+  requireConnection();
+  if (!['TARGET_LEG', 'STOP_LOSS_LEG'].includes(legName)) {
+    throw new Error('Only a super-order target or stop-loss exit leg can be cancelled by scheduled square-off.');
+  }
+  return requestDhan(`/super/orders/${encodeURIComponent(orderId)}/${legName}`, { method: 'DELETE' });
 }
 
 async function getScripMaster() {
@@ -454,7 +502,8 @@ async function getQuotes(instruments, optionSecurityIds = []) {
     const waitMs = Math.max(0, 1050 - (now - lastQuoteRequestAt));
     if (waitMs) await new Promise((resolve) => setTimeout(resolve, waitMs));
 
-    const securities = { NSE_EQ: instruments.map((instrument) => Number(instrument.securityId)) };
+    const securities = {};
+    if (instruments.length) securities.NSE_EQ = instruments.map((instrument) => Number(instrument.securityId));
     if (optionSecurityIds.length) securities.NSE_FNO = optionSecurityIds.map(Number);
 
     const result = await requestDhan('/marketfeed/quote', {
@@ -467,6 +516,14 @@ async function getQuotes(instruments, optionSecurityIds = []) {
   });
   quoteQueue = request.catch(() => {});
   return request;
+}
+
+async function getOptionQuotes(optionSecurityIds) {
+  requireConnection();
+  const ids = [...new Set(optionSecurityIds.map(String))];
+  if (!ids.length) return {};
+  const quotes = await getQuotes([], ids);
+  return quotes.NSE_FNO || {};
 }
 
 function isEntryWindowOpen(date = new Date()) {
@@ -722,24 +779,34 @@ function getOpeningGapSetup(candles, date = new Date()) {
   };
 }
 
-function calculateShortOptionRisk(entryPrice, tickSize, quantity, stopLossInr, targetInr) {
+function calculateShortOptionRisk(entryPrice, tickSize, quantity, stopLossValue, targetValue, riskUnit = 'PERCENT') {
   quantity = Number(quantity);
-  stopLossInr = Number(stopLossInr);
-  targetInr = Number(targetInr);
+  stopLossValue = Number(stopLossValue);
+  targetValue = Number(targetValue);
   if (!Number.isFinite(entryPrice) || entryPrice <= 0 || !Number.isFinite(quantity) || quantity <= 0
-    || !Number.isFinite(stopLossInr) || stopLossInr <= 0
-    || !Number.isFinite(targetInr) || targetInr <= 0) {
-    throw new Error('Configure positive stop loss and profit target amounts in INR before trading.');
+    || !Number.isFinite(stopLossValue) || stopLossValue < 0
+    || !Number.isFinite(targetValue) || targetValue < 0
+    || !['INR', 'PERCENT'].includes(riskUnit)) {
+    throw new Error('Stop loss and target must be zero or a valid non-negative value with an INR or PERCENT unit.');
   }
-  if (targetInr >= entryPrice * quantity) {
-    throw new Error('Profit target must be less than the option premium received for this position.');
+  if (riskUnit === 'PERCENT' && targetValue >= 100) {
+    throw new Error('Percentage target must be less than 100% of the option premium received.');
+  }
+  if (riskUnit === 'INR' && targetValue >= entryPrice * quantity) {
+    throw new Error('Rupee target must be less than the option premium received for this position.');
   }
   const tick = Number(tickSize) || 0.05;
-  const stopTicks = Math.ceil(((entryPrice + stopLossInr / quantity) / tick) - 1e-9);
-  const targetTicks = Math.floor(((entryPrice - targetInr / quantity) / tick) + 1e-9);
+  const stopMove = riskUnit === 'PERCENT'
+    ? entryPrice * stopLossValue / 100
+    : stopLossValue / quantity;
+  const targetMove = riskUnit === 'PERCENT'
+    ? entryPrice * targetValue / 100
+    : targetValue / quantity;
+  const stopTicks = stopLossValue === 0 ? 0 : Math.ceil(((entryPrice + stopMove) / tick) - 1e-9);
+  const targetTicks = targetValue === 0 ? 0 : Math.floor(((entryPrice - targetMove) / tick) + 1e-9);
   return {
-    stopLossPrice: Number((stopTicks * tick).toFixed(2)),
-    targetPrice: Number((Math.max(1, targetTicks) * tick).toFixed(2))
+    stopLossPrice: stopTicks ? Number((stopTicks * tick).toFixed(2)) : 0,
+    targetPrice: targetTicks ? Number((Math.max(1, targetTicks) * tick).toFixed(2)) : 0
   };
 }
 
@@ -878,10 +945,15 @@ module.exports = {
   getSuperOrders,
   getOrders,
   getFunds,
+  setStaticIp,
+  getOptionQuotes,
   checkOrderMargin,
   getLiveScan,
   createOptionOrderPreview,
   placeSuperOrder,
+  placeRegularOrder,
+  cancelRegularOrder,
+  cancelSuperOrderLeg,
   requireConnection,
   chooseOptionExpiry,
   optionTargetForSignal,

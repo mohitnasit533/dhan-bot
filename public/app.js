@@ -14,6 +14,7 @@ let missingRiskSettings = [];
 let maxOpenTrades = 5;
 let latestScannerResults = [];
 let scannerRenderSignature = '';
+let mcpConnected = false;
 
 function showNotice(message, kind = '') {
   notice.textContent = message || '';
@@ -26,15 +27,15 @@ function updateAutoTradeAvailability() {
   const ready = paperMode || (connected && riskSettingsReady);
   const missing = missingRiskSettings.length
       ? missingRiskSettings.join(', ')
-      : 'daily max loss, stop loss, and profit target';
+      : 'option liquidity controls';
   toggle.disabled = !ready && !autoTradeEnabled;
   toggle.title = ready
       ? paperMode
         ? riskSettingsReady
           ? 'Automatically simulate confirmed signals. Dhan data and saved risk settings are required before paper entries.'
-          : 'Enable Paper Auto scan. Simulated entries remain blocked until risk limits are saved.'
+          : 'Enable Paper Auto scan. Simulated entries remain blocked until option-liquidity filters are saved.'
         : 'Automatically enter confirmed signals. Live mode can place real orders.'
-        : `Connect and verify Dhan before enabling Live Auto trade; save positive risk values: ${missing}.`;
+        : `Connect and verify Dhan before enabling Live Auto trade; configure valid controls: ${missing}.`;
   $('#auto-trade-readiness').textContent = paperMode && !riskSettingsReady
       ? `Paper Auto can be toggled, but simulated entries are blocked until these controls are saved: ${missing}.`
       : paperMode && !connected
@@ -137,6 +138,7 @@ function setConnected(value, profile, tokenRenewal, verification = {}) {
     : verification.error || 'This local server has not verified a Dhan profile.';
   document.body.classList.toggle('dhan-connected', connected);
   $('#disconnect-button').classList.toggle('hidden', !connected);
+  $('#dhan-ip-form').classList.toggle('hidden', !connected);
   const form = $('#connect-form');
   form.querySelectorAll('label, button[type="submit"]').forEach((element) => {
     element.classList.toggle('hidden', connected);
@@ -169,9 +171,9 @@ async function refreshConnection(updateSettings = true) {
       const form = $('#trade-settings');
       form.elements.lots.value = settings.lotSize ?? 1;
       form.elements.maxTrades.value = settings.maxTrades ?? 5;
-      form.elements.maxDailyLossInr.value = settings.maxDailyLossInr ?? '';
-      form.elements.stopLossInr.value = settings.stopLossInr ?? '';
-      form.elements.targetInr.value = settings.targetInr ?? '';
+      form.elements.riskUnit.value = settings.riskUnit ?? 'PERCENT';
+      form.elements.stopLossValue.value = settings.stopLossValue ?? 0;
+      form.elements.targetValue.value = settings.targetValue ?? 0;
       form.elements.minOpenInterest.value = settings.minOpenInterest ?? 1000;
       form.elements.maxSpreadPct.value = settings.maxSpreadPct ?? 2;
       maxOpenTrades = settings.maxTrades ?? 5;
@@ -179,6 +181,22 @@ async function refreshConnection(updateSettings = true) {
   } finally {
     connectionRefreshInFlight = false;
   }
+}
+
+async function refreshMcpStatus() {
+  const status = await api('/api/mcp/status');
+  mcpConnected = Boolean(status.connected);
+  $('#mcp-status').textContent = status.connected
+    ? `Dhan MCP connected · ${status.toolCount} tools`
+    : status.authorized
+      ? 'Dhan MCP authorization saved · reconnect to verify'
+      : 'Dhan MCP not connected';
+  $('#mcp-info').textContent = status.message;
+  $('#mcp-connect').classList.toggle('hidden', mcpConnected);
+  $('#mcp-disconnect').classList.toggle('hidden', !status.authorized);
+  $('#mcp-tools').innerHTML = (status.marketDataTools || []).map((tool) => (
+    `<li><code>${escapeHtml(tool.name)}</code> — ${escapeHtml(tool.description || 'Read-only market-data candidate')}</li>`
+  )).join('');
 }
 
 function renderScanner(results = []) {
@@ -294,7 +312,9 @@ function renderPositions(positions = []) {
       <td>${formatPrice(trade.currentPrice ?? trade.lastPrice ?? trade.ltp)}</td>
       <td>${Number.isFinite(pnl) ? `${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}%` : '—'}</td>
       <td class="${pnlClass}">${formatRupees(pnlInr)}</td>
-      <td>${trade.stopPrice ? `${formatPrice(trade.stopPrice)} / ${formatPrice(trade.targetPrice)}` : '—'}</td>
+      <td>${trade.stopPrice || trade.targetPrice
+        ? `${trade.stopPrice ? formatPrice(trade.stopPrice) : 'SL off'} / ${trade.targetPrice ? formatPrice(trade.targetPrice) : 'Target off'}`
+        : 'Off · 14:58'}</td>
       <td>${paperClose}</td>
     </tr>`;
   }).join('');
@@ -348,9 +368,9 @@ function tradeSettingsPayload(form, enabled) {
     enabled,
     lotSize: Number(values.lots),
     maxTrades: Number(values.maxTrades),
-    maxDailyLossInr: optionalNumber(values.maxDailyLossInr),
-    stopLossInr: optionalNumber(values.stopLossInr),
-    targetInr: optionalNumber(values.targetInr),
+    riskUnit: values.riskUnit,
+    stopLossValue: optionalNumber(values.stopLossValue),
+    targetValue: optionalNumber(values.targetValue),
     minOpenInterest: optionalNumber(values.minOpenInterest),
     maxSpreadPct: optionalNumber(values.maxSpreadPct)
   };
@@ -445,6 +465,23 @@ $('#disconnect-button').addEventListener('click', async () => {
     showNotice('Dhan disconnected. Trading mode returned to Paper.', 'success');
   } catch (error) {
     showNotice(error.message, 'error');
+  }
+});
+
+$('#dhan-ip-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const button = form.querySelector('[type="submit"]');
+  const values = formValues(form);
+  if (!confirm(`Register ${values.ip} as the ${values.ipFlag} Dhan static IP? Dhan says this slot cannot be changed for 7 days. Verify the address and slot before continuing.`)) return;
+  button.disabled = true;
+  try {
+    const data = await api('/api/connection/register-ip', { method: 'POST', body: JSON.stringify(values) });
+    showNotice(data.message, 'success');
+  } catch (error) {
+    showNotice(error.message, 'error');
+  } finally {
+    button.disabled = false;
   }
 });
 
@@ -598,10 +635,49 @@ $('#cancel-preview').addEventListener('click', () => {
   $('#preview-card').classList.add('hidden');
 });
 
+$('#mcp-connect').addEventListener('click', async (event) => {
+  const button = event.currentTarget;
+  button.disabled = true;
+  try {
+    const result = await api('/api/mcp/connect', { method: 'POST' });
+    if (result.authorizationUrl) {
+      window.location.assign(result.authorizationUrl);
+      return;
+    }
+    await refreshMcpStatus();
+    showNotice('Dhan MCP is connected. Its read-only tool catalog is available for validation.', 'success');
+  } catch (error) {
+    showNotice(error.message, 'error');
+  } finally {
+    button.disabled = false;
+  }
+});
+
+$('#mcp-disconnect').addEventListener('click', async (event) => {
+  event.currentTarget.disabled = true;
+  try {
+    const result = await api('/api/mcp/disconnect', { method: 'POST' });
+    await refreshMcpStatus();
+    showNotice(result.message, 'success');
+  } catch (error) {
+    showNotice(error.message, 'error');
+  } finally {
+    event.currentTarget.disabled = false;
+  }
+});
+
 async function initialize() {
   try {
     await refreshConnection();
+    await refreshMcpStatus();
     await refreshScanner(false);
+    const mcpCallback = new URLSearchParams(window.location.search).get('dhanMcp');
+    if (mcpCallback) {
+      window.history.replaceState(null, '', window.location.pathname);
+      showNotice(mcpCallback === 'connected'
+        ? 'Dhan MCP authorization succeeded. The discovered tool catalog is ready for review.'
+        : 'Dhan MCP authorization did not complete. Retry the connection and approve the Dhan request.', mcpCallback === 'connected' ? 'success' : 'error');
+    }
   } catch (error) {
     showNotice(error.message, 'error');
     $('#scanner-caption').textContent = 'The local server is running, but scanner data is unavailable.';

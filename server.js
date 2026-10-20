@@ -7,6 +7,7 @@ require('dotenv').config({ path: path.join(__dirname, '.env') });
 const helmet = require('helmet');
 const { rateLimit } = require('express-rate-limit');
 const dhan = require('./dhan');
+const { createDhanMcp } = require('./dhan-mcp');
 const { isEntryWindowOpen } = dhan;
 const { isAllowedLocalHost, isSameOriginRequest } = require('./local-security');
 const {
@@ -21,6 +22,7 @@ const { saveAccessToken, saveDhanCredentials } = require('./token-env-store');
 const { createLocalStateStore } = require('./local-state-store');
 const { createMarketSafety } = require('./market-safety');
 const { createAppLogger } = require('./app-logger');
+const { reviewLiveSquareOff } = require('./live-squareoff');
 const {
   DEFAULT_SETTINGS,
   validateTradeSettings,
@@ -28,7 +30,7 @@ const {
   calculatePaperDailyPnl,
   calculateBotLiveDailyPnl,
   indiaDate,
-  dailyLossReached
+  isSquareOffTime
 } = require('./risk-controls');
 
 const app = express();
@@ -39,6 +41,7 @@ const LOCAL_STATE_PATH = path.join(__dirname, '.dhan-local-state.json');
 const MARKET_SAFETY_STATE_PATH = path.join(__dirname, '.dhan-market-safety.json');
 const LOG_DIRECTORY = path.join(__dirname, '.dhan-logs');
 const ENV_FILE_PATH = path.join(__dirname, '.env');
+const DHAN_MCP_CALLBACK_URL = `http://${HOST}:${PORT}/api/mcp/callback`;
 const TOKEN_RENEW_INTERVAL_MS = 20 * 60 * 60 * 1000;
 const TOKEN_RETRY_INTERVAL_MS = 10 * 60 * 1000;
 const MAX_ACTIVE_TRADES = 5;
@@ -47,6 +50,7 @@ const localStateStore = createLocalStateStore(LOCAL_STATE_PATH, DEFAULT_SETTINGS
 const persistedState = localStateStore.getState();
 const marketSafety = createMarketSafety({ statePath: MARKET_SAFETY_STATE_PATH });
 const appLogger = createAppLogger(LOG_DIRECTORY);
+const dhanMcp = createDhanMcp({ redirectUrl: DHAN_MCP_CALLBACK_URL });
 let tradingMode = 'PAPER';
 let tokenRenewalTimer = null;
 let tokenRenewalStatus = { enabled: false, message: 'Add Dhan credentials to .env to enable automatic token renewal.' };
@@ -137,35 +141,11 @@ function getPaperDailyPnl() {
   return calculatePaperDailyPnl(getActiveTradesList(), closedTrades);
 }
 
-function assertRiskConfigured() {
-  const missing = missingRiskSettings(autoTradeConfig.settings);
-  if (missing.length) throw new Error(`Configure these trade controls before placing orders: ${missing.join(', ')}.`);
-}
-
 function getDailyPnl(brokerPositions) {
   const livePositions = tradingMode === 'LIVE'
     ? brokerPositions ?? marketSnapshot?.brokerPositions ?? []
     : [];
   return getPaperDailyPnl() + calculateBotLiveDailyPnl(liveTrades, livePositions);
-}
-
-let killSwitchAlertDate = null;
-function assertDailyLossLimit(brokerPositions = []) {
-  const pnl = getDailyPnl(brokerPositions);
-  if (dailyLossReached(pnl, autoTradeConfig.settings.maxDailyLossInr)) {
-    const firstAlertToday = killSwitchAlertDate !== indiaDate();
-    killSwitchAlertDate = indiaDate();
-    autoTradeConfig.enabled = false;
-    saveLocalState();
-    if (firstAlertToday) {
-      void notify('critical', 'Daily max-loss kill switch activated; new bot entries are blocked.', {
-        dailyPnlInr: Number(pnl.toFixed(2)),
-        maxDailyLossInr: autoTradeConfig.settings.maxDailyLossInr
-      });
-    }
-    throw new Error(`Daily max-loss kill switch is active: this bot is down ₹${Math.abs(pnl).toFixed(2)} today. New entries are blocked.`);
-  }
-  return pnl;
 }
 
 async function notify(level, message, details = {}) {
@@ -239,6 +219,7 @@ function createPaperTrade(preview) {
     side: `SELL ${optionType}`,
     optionType,
     securityId: preview.order.securityId,
+    tickSize: preview.tickSize,
     strike: preview.preview.Strike,
     expiry: preview.preview.Expiry,
     lotSize: preview.lots,
@@ -247,8 +228,9 @@ function createPaperTrade(preview) {
     currentPrice: preview.order.price,
     stopPrice: preview.order.stopLossPrice,
     targetPrice: preview.order.targetPrice,
-    stopLossInr: preview.risk.stopLossInr,
-    targetInr: preview.risk.targetInr,
+    riskUnit: preview.risk.unit,
+    stopLossValue: preview.risk.stopLossValue,
+    targetValue: preview.risk.targetValue,
     status: 'OPEN',
     openedAt: new Date().toISOString(),
     pnlPct: 0,
@@ -297,7 +279,19 @@ function syncPaperTrades(optionQuotes) {
   for (const trade of getActiveTradesList()) {
     const previousTrade = { ...trade };
     const currentPrice = Number(optionQuotes[trade.securityId]?.last_price);
-    if (!Number.isFinite(currentPrice) || currentPrice <= 0) continue;
+    if (!Number.isFinite(currentPrice) || currentPrice <= 0) {
+      const priorAlertTime = Date.parse(trade.eodSquareOffQuoteAlertedAt || '');
+      const alertedToday = Number.isFinite(priorAlertTime)
+        && indiaDate(new Date(priorAlertTime)) === indiaDate();
+      if (isSquareOffTime() && !alertedToday) {
+        trade.eodSquareOffQuoteAlertedAt = new Date().toISOString();
+        const message = `${trade.symbol}: no valid option quote was available at the 14:58 IST Paper square-off. The simulated position remains open.`;
+        autoTradeConfig.lastError = message;
+        saveLocalState();
+        void notify('critical', message, { symbol: trade.symbol, securityId: trade.securityId });
+      }
+      continue;
+    }
 
     trade.currentPrice = currentPrice;
 
@@ -306,10 +300,13 @@ function syncPaperTrades(optionQuotes) {
     trade.pnlPct = pnlPct;
     trade.pnlInr = (trade.entryPrice - currentPrice) * trade.quantity;
 
-    const shouldClose = currentPrice >= trade.stopPrice || currentPrice <= trade.targetPrice;
+    const stopTriggered = Number(trade.stopPrice) > 0 && currentPrice >= Number(trade.stopPrice);
+    const targetTriggered = Number(trade.targetPrice) > 0 && currentPrice <= Number(trade.targetPrice);
+    const endOfDay = isSquareOffTime() && !stopTriggered && !targetTriggered;
+    const shouldClose = stopTriggered || targetTriggered || endOfDay;
     if (shouldClose) {
       trade.status = 'CLOSED';
-      trade.exitReason = currentPrice >= trade.stopPrice ? 'STOP_LOSS' : 'TARGET';
+      trade.exitReason = stopTriggered ? 'STOP_LOSS' : targetTriggered ? 'TARGET' : 'END_OF_DAY';
       trade.exitPrice = currentPrice;
       trade.closedAt = new Date().toISOString();
       try {
@@ -319,7 +316,9 @@ function syncPaperTrades(optionQuotes) {
         Object.assign(trade, previousTrade);
         throw error;
       }
-      void notify('info', 'Paper position closed by its configured risk exit.', {
+      void notify('info', endOfDay && !stopTriggered && !targetTriggered
+        ? 'Paper position closed at the scheduled 14:58 IST square-off.'
+        : 'Paper position closed by its configured risk exit.', {
         symbol: trade.symbol,
         exitReason: trade.exitReason,
         pnlInr: Number(trade.pnlInr.toFixed(2))
@@ -330,8 +329,6 @@ function syncPaperTrades(optionQuotes) {
 
 async function runPaperAutoTrades(results) {
   if (!isEntryWindowOpen()) return;
-  if (missingRiskSettings(autoTradeConfig.settings).length) return;
-
   for (const result of results) {
     if (!autoTradeConfig.enabled) return;
     if (result.signal !== 'BUY' && result.signal !== 'SELL') {
@@ -348,8 +345,6 @@ async function runPaperAutoTrades(results) {
     if (activeTrades.size >= autoTradeConfig.settings.maxTrades) continue;
 
     try {
-      assertRiskConfigured();
-      assertDailyLossLimit();
       await marketSafety.assertCanTrade(result.symbol);
       const orderPreview = await dhan.createOptionOrderPreview({
         symbol: result.symbol,
@@ -364,7 +359,6 @@ async function runPaperAutoTrades(results) {
       if (!autoTradeConfig.enabled || tradingMode !== 'PAPER' || !dhan.getConnection()) return;
       if (latest?.signal !== result.signal || latest?.lastCandleAt !== result.lastCandleAt || latest?.dataState !== 'READY') continue;
       syncPaperTrades(latestScan.optionQuotes);
-      assertDailyLossLimit();
       if (activeTrades.has(result.symbol) || activeTrades.size >= autoTradeConfig.settings.maxTrades) continue;
       if (!rememberAutoSignal(result.symbol, signalKey)) continue;
       createPaperTrade({ ...orderPreview, symbol: result.symbol, lots: autoTradeConfig.settings.lotSize, entryType: 'AUTO' });
@@ -376,7 +370,6 @@ async function runPaperAutoTrades(results) {
       autoTradeConfig.lastError = null;
     } catch (error) {
       autoTradeConfig.lastError = `${result.symbol}: ${error.message}`;
-      if (error.message.includes('Daily max-loss')) return;
     }
   }
 }
@@ -407,8 +400,6 @@ async function runLiveAutoTrades(results, positions, superOrders, regularOrders)
     liveSubmissionLocks.set(result.symbol, reservation);
     let orderSubmissionAttempted = false;
     try {
-      assertRiskConfigured();
-      assertDailyLossLimit(positions);
       await marketSafety.assertCanTrade(result.symbol);
       const preview = await dhan.createOptionOrderPreview({
         symbol: result.symbol,
@@ -454,7 +445,6 @@ async function runLiveAutoTrades(results, positions, superOrders, regularOrders)
         liveSubmissionLocks.delete(result.symbol);
         continue;
       }
-      assertDailyLossLimit(currentPositions);
       await marketSafety.assertCanTrade(result.symbol);
       const margin = await dhan.checkOrderMargin(preview.order);
       if (!autoTradeConfig.enabled || tradingMode !== 'LIVE' || !dhan.getConnection() || !isEntryWindowOpen()) {
@@ -470,6 +460,7 @@ async function runLiveAutoTrades(results, positions, superOrders, regularOrders)
       const liveTrade = {
         symbol: result.symbol,
         securityId: preview.order.securityId,
+        tickSize: preview.tickSize,
         entryPrice: preview.order.price,
         quantity: preview.order.quantity,
         openedAt: new Date().toISOString(),
@@ -537,29 +528,77 @@ function scheduleLiveAutoTrades(results, positions, superOrders, regularOrders) 
 
 let marketCyclePromise = null;
 let marketSnapshot = null;
+async function reviewTrackedLiveSquareOff(positions, superOrders, regularOrders, optionQuotes) {
+  const profile = dhan.getConnection();
+  if (!profile) return;
+  for (const trade of liveTrades) {
+    if (trade.status === 'CLOSED') continue;
+    const position = positions.find((item) => String(item.securityId) === String(trade.securityId));
+    try {
+      const result = await reviewLiveSquareOff({
+        trade,
+        position,
+        superOrders,
+        regularOrders,
+        optionQuote: optionQuotes?.[trade.securityId],
+        broker: {
+          clientId: profile.clientId,
+          cancelSuperOrderLeg: dhan.cancelSuperOrderLeg,
+          cancelRegularOrder: dhan.cancelRegularOrder,
+          placeRegularOrder: dhan.placeRegularOrder
+        },
+        save: saveLocalState,
+        notify
+      });
+      if (trade.eodExitLastError) {
+        autoTradeConfig.lastError = `${trade.symbol}: ${trade.eodExitLastError}`;
+      } else if (result.action.startsWith('SUBMITTED_') || result.action === 'POSITION_ALREADY_FLAT') {
+        autoTradeConfig.lastError = null;
+      }
+      if (result.action === 'SUBMITTED_LIMIT' || result.action === 'SUBMITTED_MARKET') {
+        void notify('warning', `Scheduled ${result.action.endsWith('LIMIT') ? 'LIMIT' : 'MARKET'} square-off order submitted for a bot-tracked Live position.`, {
+          symbol: trade.symbol,
+          orderId: result.orderId || 'pending reconciliation',
+          quantity: trade.eodExitQuantity
+        });
+      }
+    } catch (error) {
+      autoTradeConfig.lastError = `${trade.symbol}: Live square-off could not be persisted or reconciled: ${error.message}`;
+      await notify('critical', autoTradeConfig.lastError, { symbol: trade.symbol, securityId: trade.securityId });
+    }
+  }
+}
+
 async function updateMarketSnapshot() {
   if (marketCyclePromise) return marketCyclePromise;
   const cycle = (async () => {
-    const optionIds = tradingMode === 'PAPER' ? getActiveTradesList().map((trade) => trade.securityId) : [];
+    const optionIds = [...getActiveTradesList(), ...liveTrades.filter((trade) => trade.status !== 'CLOSED')]
+      .map((trade) => trade.securityId);
     const scan = await dhan.getLiveScan(optionIds);
     allowedSymbols = new Set(scan.results.map((row) => row.symbol));
-    if (tradingMode === 'PAPER') {
-      syncPaperTrades(scan.optionQuotes);
-      checkDailyLossAfterSnapshot([]);
-      if (autoTradeConfig.enabled) await runPaperAutoTrades(scan.results);
-      marketSnapshot = { scan, brokerPositions: [], activePositions: getActiveTradesList() };
-    } else {
-      const [positions, superOrders, regularOrders] = await Promise.all([
+    syncPaperTrades(scan.optionQuotes);
+    const shouldCheckBrokerPositions = tradingMode === 'LIVE'
+      || liveTrades.some((trade) => trade.status !== 'CLOSED');
+    let positions = [];
+    let superOrders = [];
+    let regularOrders = [];
+    if (shouldCheckBrokerPositions) {
+      [positions, superOrders, regularOrders] = await Promise.all([
         dhan.getPositions(),
         dhan.getSuperOrders(),
         dhan.getOrders()
       ]);
       syncBotLiveTrades(positions);
-      const brokerPositions = positions.filter((position) => Number(position.netQty) !== 0);
-      checkDailyLossAfterSnapshot(positions);
+      await reviewTrackedLiveSquareOff(positions, superOrders, regularOrders, scan.optionQuotes);
       for (const [symbol, reservation] of liveSubmissionLocks) {
         if (isReconciledOrderTerminal(superOrders, regularOrders, reservation)) liveSubmissionLocks.delete(symbol);
       }
+    }
+    if (tradingMode === 'PAPER') {
+      if (autoTradeConfig.enabled) await runPaperAutoTrades(scan.results);
+      marketSnapshot = { scan, brokerPositions: [], activePositions: getActiveTradesList() };
+    } else {
+      const brokerPositions = positions.filter((position) => Number(position.netQty) !== 0);
       if (autoTradeConfig.enabled) scheduleLiveAutoTrades(scan.results, positions, superOrders, regularOrders);
       marketSnapshot = { scan, brokerPositions, activePositions: [] };
     }
@@ -573,17 +612,86 @@ async function updateMarketSnapshot() {
   }
 }
 
-function checkDailyLossAfterSnapshot(positions) {
-  try {
-    assertDailyLossLimit(positions);
-  } catch (error) {
-    if (!error.message.startsWith('Daily max-loss kill switch is active:')) throw error;
-    autoTradeConfig.lastError = error.message;
-  }
-}
-
 app.get('/api/health', (req, res) => {
   res.json({ ok: true, service: 'dhan-local-dashboard', timestamp: new Date().toISOString() });
+});
+
+app.get('/api/mcp/status', (req, res) => {
+  const status = dhanMcp.getStatus();
+  res.json({
+    ok: true,
+    ...status,
+    scannerUsesMcp: false,
+    message: status.connected
+      ? 'Dhan MCP is authorized and its tool catalog is available. Scanner data remains on the verified Dhan API until compatible read-only market-data tools are validated.'
+      : 'Dhan MCP is not connected. Connect to authorize and inspect its tools.'
+  });
+});
+
+app.post('/api/mcp/connect', rateLimit({
+  windowMs: 60 * 1000,
+  limit: 5,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  validate: { xForwardedForHeader: false }
+}), async (req, res) => {
+  try {
+    const status = await dhanMcp.connect();
+    res.json({ ok: true, ...status });
+  } catch (error) {
+    appLogger.write('error', 'Dhan MCP connection failed', {
+      errorName: error?.name || 'Error',
+      statusCode: Number.isInteger(error?.statusCode) ? error.statusCode : null
+    });
+    res.status(502).json({
+      ok: false,
+      message: 'Could not connect to Dhan MCP. Check the network and try again; no trading action was submitted.'
+    });
+  }
+});
+
+app.get('/api/mcp/callback', async (req, res) => {
+  try {
+    const callbackUrl = new URL(req.originalUrl, `http://${HOST}`);
+    await dhanMcp.finishAuthorization(callbackUrl.searchParams);
+    res.redirect('/?dhanMcp=connected');
+  } catch (error) {
+    appLogger.write('error', 'Dhan MCP authorization callback failed', {
+      errorName: error?.name || 'Error',
+      statusCode: Number.isInteger(error?.statusCode) ? error.statusCode : null
+    });
+    res.redirect('/?dhanMcp=failed');
+  }
+});
+
+app.post('/api/mcp/market-data', async (req, res) => {
+  try {
+    const result = await dhanMcp.callMarketData(req.body?.action, req.body?.payload);
+    res.json({ ok: true, result });
+  } catch (error) {
+    const statusCode = /Connect and authorize|Unsupported MCP market-data action|payload|tool schema|security IDs|exchange segment|does not expose/i.test(error.message)
+      ? 409
+      : Number(error.statusCode) || 502;
+    appLogger.write('error', 'Dhan MCP market-data request failed', {
+      errorName: error?.name || 'Error',
+      statusCode: Number.isInteger(error?.statusCode) ? error.statusCode : null
+    });
+    res.status(statusCode).json({
+      ok: false,
+      message: statusCode === 409
+        ? error.message
+        : 'Dhan MCP market-data request failed. No trading or order action was submitted.'
+    });
+  }
+});
+
+app.post('/api/mcp/disconnect', (req, res) => {
+  dhanMcp.disconnect();
+  res.json({
+    ok: true,
+    ...dhanMcp.getStatus(),
+    message: 'Dhan MCP credentials were removed from this server’s memory. Dhan API credentials and trading mode are unchanged.'
+  });
 });
 
 function suspendAutoTrade(reason) {
@@ -629,6 +737,37 @@ app.get('/api/connection', async (req, res) => {
     marketSafety: marketSafety.getStatus(),
     persistenceError: persistenceFailure
   });
+});
+
+app.post('/api/connection/register-ip', rateLimit({
+  windowMs: 60 * 60 * 1000,
+  limit: 3,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  validate: { xForwardedForHeader: false }
+}), async (req, res) => {
+  if (!dhan.getConnection()) {
+    return res.status(401).json({ ok: false, message: 'Connect and verify Dhan before requesting IP registration.' });
+  }
+  try {
+    await dhan.verifyConnection();
+    const { ip, ipFlag } = req.body || {};
+    await dhan.setStaticIp(ip, ipFlag);
+    appLogger.write('info', 'Dhan static IP registration accepted', { ipFlag });
+    res.json({
+      ok: true,
+      message: `Dhan accepted the ${ipFlag} static-IP registration. Verify the address in your Dhan account before placing live orders.`
+    });
+  } catch (error) {
+    appLogger.write('error', 'Dhan current-network IP registration failed', {
+      errorName: error?.name || 'Error',
+      statusCode: Number.isInteger(error?.statusCode) ? error.statusCode : null
+    });
+    res.status(error.statusCode || 502).json({
+      ok: false,
+      message: 'Dhan did not confirm IP registration. Check your API permissions, account settings, and network before trying again.'
+    });
+  }
 });
 
 app.post('/api/connect', rateLimit({
@@ -824,8 +963,6 @@ app.post('/api/trade/preview', async (req, res) => {
   }
 
   try {
-    assertRiskConfigured();
-    if (tradingMode === 'LIVE') assertDailyLossLimit(await dhan.getPositions());
     await marketSafety.assertCanTrade(symbol);
     const scan = await dhan.getLiveScan(getActiveTradesList().map((trade) => trade.securityId));
     if (tradingMode !== requestedMode || !dhan.getConnection()) {
@@ -833,7 +970,6 @@ app.post('/api/trade/preview', async (req, res) => {
     }
     if (tradingMode === 'PAPER') {
       syncPaperTrades(scan.optionQuotes);
-      assertDailyLossLimit();
     }
     const signalRow = scan.results.find((item) => item.symbol === symbol);
     if (!signalRow || signalRow.signal !== signal) {
@@ -901,7 +1037,6 @@ app.post('/api/trade/execute', async (req, res) => {
   }
 
   try {
-    assertRiskConfigured();
     await marketSafety.assertCanTrade(preview.symbol);
   } catch (error) {
     return res.status(409).json({ ok: false, message: error.message });
@@ -932,7 +1067,6 @@ app.post('/api/trade/execute', async (req, res) => {
     const latestScan = await dhan.getLiveScan();
     const currentRow = latestScan.results.find((item) => item.symbol === preview.symbol);
     if (tradingMode === 'PAPER') syncPaperTrades(latestScan.optionQuotes);
-    assertDailyLossLimit(tradingMode === 'LIVE' ? await dhan.getPositions() : []);
     if (currentRow?.signal !== preview.signal || currentRow.dataState !== 'READY') {
       if (tradingMode === 'LIVE') liveSubmissionLocks.delete(liveSymbol);
       return res.status(409).json({ ok: false, message: 'The confirmed 15-minute signal changed after preview. Refresh the scanner and create a fresh preview.' });
@@ -976,7 +1110,6 @@ app.post('/api/trade/execute', async (req, res) => {
       dhan.getSuperOrders(),
       dhan.getOrders()
     ]);
-    assertDailyLossLimit(positions);
     const openPositions = positions.filter((position) => Number(position.netQty) !== 0);
     const pendingUnderlyingOrder = findActiveSuperOrder(superOrders, preview.underlying)
       || findActiveRegularOrder(regularOrders, preview.underlying);
@@ -1019,7 +1152,6 @@ app.post('/api/trade/execute', async (req, res) => {
       liveSubmissionLocks.delete(liveSymbol);
       return res.status(409).json({ ok: false, message: `The configured maximum of ${autoTradeConfig.settings.maxTrades} live positions has been reached.` });
     }
-    assertDailyLossLimit(finalPositions);
     await marketSafety.assertCanTrade(preview.symbol);
     if (!dhan.getConnection() || tradingMode !== preview.mode || !isEntryWindowOpen()) {
       liveSubmissionLocks.delete(liveSymbol);
@@ -1028,6 +1160,7 @@ app.post('/api/trade/execute', async (req, res) => {
     const liveTrade = {
       symbol: preview.symbol,
       securityId: preview.order.securityId,
+      tickSize: preview.tickSize,
       entryPrice: preview.order.price,
       quantity: preview.order.quantity,
       openedAt: new Date().toISOString(),
@@ -1217,7 +1350,8 @@ server.on('error', (error) => {
 });
 
 const serverAutoScanTimer = setInterval(() => {
-  if (!autoTradeConfig.enabled || !dhan.getConnection()) return;
+  const hasManagedPositions = activeTrades.size > 0 || liveTrades.some((trade) => trade.status !== 'CLOSED');
+  if ((!autoTradeConfig.enabled && !hasManagedPositions) || !dhan.getConnection()) return;
   updateMarketSnapshot().catch((error) => { autoTradeConfig.lastError = error.message; });
 }, 1000);
 serverAutoScanTimer.unref();

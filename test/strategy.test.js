@@ -147,12 +147,20 @@ test('opening-gap confirmation only fires on the current last candle', () => {
   assert.equal(setup.signal, 'WATCH');
 });
 
-test('calculates short-option stop and target from configured INR risk', () => {
-  assert.deepEqual(calculateShortOptionRisk(100, 0.05, 10, 200, 500), {
+test('calculates short-option stop and target from rupee risk or percentage of premium', () => {
+  assert.deepEqual(calculateShortOptionRisk(100, 0.05, 10, 200, 500, 'INR'), {
     stopLossPrice: 120,
     targetPrice: 50
   });
-  assert.throws(() => calculateShortOptionRisk(100, 0.05, 10, null, 500), /Configure positive stop loss/);
+  assert.deepEqual(calculateShortOptionRisk(100, 0.05, 10, 20, 50, 'PERCENT'), {
+    stopLossPrice: 120,
+    targetPrice: 50
+  });
+  assert.deepEqual(calculateShortOptionRisk(100, 0.05, 10, 0, 0, 'PERCENT'), {
+    stopLossPrice: 0,
+    targetPrice: 0
+  });
+  assert.throws(() => calculateShortOptionRisk(100, 0.05, 10, -1, 50), /valid non-negative value/);
 });
 
 test('keeps every NSE F&O underlying and ranks available quotes by turnover', () => {

@@ -14,7 +14,15 @@ test('persists open and closed trades and restores them after a restart', (conte
   const statePath = path.join(directory, 'state.json');
   const store = createLocalStateStore(statePath, DEFAULT_SETTINGS, validateTradeSettings);
   store.save({
-    settings: { ...DEFAULT_SETTINGS, stopLossInr: 200, targetInr: 300, maxDailyLossInr: 1000 },
+    settings: {
+      lotSize: 1,
+      maxTrades: 5,
+      stopLossInr: 200,
+      targetInr: 300,
+      maxDailyLossInr: 1000,
+      minOpenInterest: 1000,
+      maxSpreadPct: 2
+    },
     activeTrades: [{ symbol: 'RELIANCE', status: 'OPEN', entryPrice: 100, quantity: 10, openedAt: '2026-10-20T09:00:00Z' }],
     closedTrades: [{ symbol: 'TCS', status: 'CLOSED', entryPrice: 50, quantity: 2, openedAt: '2026-10-20T09:00:00Z', closedAt: '2026-10-20T09:30:00Z' }],
     liveTrades: []
@@ -23,7 +31,10 @@ test('persists open and closed trades and restores them after a restart', (conte
   const restored = createLocalStateStore(statePath, DEFAULT_SETTINGS, validateTradeSettings).getState();
   assert.equal(restored.activeTrades.length, 1);
   assert.equal(restored.closedTrades.length, 1);
-  assert.equal(restored.settings.stopLossInr, 200);
+  assert.equal(restored.settings.riskUnit, 'INR');
+  assert.equal(restored.settings.stopLossValue, 200);
+  assert.equal(restored.settings.targetValue, 300);
+  assert.equal(Object.hasOwn(restored.settings, 'maxDailyLossInr'), false);
 });
 
 test('does not overwrite or silently reset state with an unsupported schema', (context) => {

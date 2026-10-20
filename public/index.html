@@ -401,7 +401,7 @@
         <h1 id="market-headline">New entries are open</h1>
         <p class="subtitle">Entries stop at 14:00 IST. Signals use closed 15-minute candles.</p>
         <div class="session-timeline" aria-hidden="true"><span></span><span></span><span></span><span></span></div>
-        <div class="session-labels"><span>09:45</span><span>14:00</span><span>15:15</span></div>
+        <div class="session-labels"><span>09:45</span><span>14:00</span><span>14:58</span></div>
         <div class="session-legend"><span><i class="legend-dot"></i>Opening range</span><span><i class="legend-dot new"></i>New entries</span><span><i class="legend-dot manage"></i>Manage only</span><span><i class="legend-dot square"></i>Square-off</span></div>
       </div>
       <section class="hero-account" aria-label="Dhan account">
@@ -422,7 +422,29 @@
             <button id="disconnect-button" type="button" class="danger hidden">Disconnect</button>
           </div>
         </form>
+        <form id="dhan-ip-form" class="form-grid hidden">
+          <label>Public static IP
+            <input name="ip" autocomplete="off" required maxlength="45" placeholder="Enter your ISP’s static IPv4 or IPv6 address">
+          </label>
+          <label>IP slot
+            <select name="ipFlag" required>
+              <option value="PRIMARY">Primary</option>
+              <option value="SECONDARY">Secondary</option>
+            </select>
+          </label>
+          <button type="submit">Register static IP with Dhan</button>
+        </form>
+        <p class="note">Dhan requires a static IP for live order APIs. Its setIP endpoint locks the selected IP slot for 7 days; enter the confirmed address from your ISP and choose the intended slot carefully.</p>
         <p id="connection-info" class="note">Credentials stay on this computer.</p>
+        <div class="mcp-connection">
+          <div class="inline">
+            <strong id="mcp-status" aria-live="polite">Dhan MCP not connected</strong>
+            <button id="mcp-connect" type="button">Connect Dhan MCP</button>
+            <button id="mcp-disconnect" type="button" class="danger hidden">Disconnect MCP</button>
+          </div>
+          <p id="mcp-info" class="note">MCP login is separate from the Dhan API token. Its read-only tools are not used by the scanner until their market-data contract is verified.</p>
+          <ul id="mcp-tools" class="note"></ul>
+        </div>
       </section>
     </section>
 
@@ -471,21 +493,25 @@
             <label>Max positions<input name="maxTrades" type="number" min="1" max="5" step="1" value="5" required></label>
           </div>
           <div class="two-col">
-            <label>Daily max loss (₹)<input name="maxDailyLossInr" type="number" min="0.01" step="0.01" placeholder="Required before trading"></label>
-            <label>Stop loss per position (₹)<input name="stopLossInr" type="number" min="0.01" step="0.01" placeholder="Required before trading"></label>
-            <label>Profit target per position (₹)<input name="targetInr" type="number" min="0.01" step="0.01" placeholder="Required before trading"></label>
+              <label>Risk unit
+                <select name="riskUnit">
+                  <option value="PERCENT">Percentage of option premium</option>
+                  <option value="INR">Rupees per position</option>
+                </select>
+              </label>
+              <label>Stop loss per position<input name="stopLossValue" type="number" min="0" step="0.01" value="0" required></label>
+              <label>Profit target per position<input name="targetValue" type="number" min="0" step="0.01" value="0" required></label>
               <label>Minimum option OI<input name="minOpenInterest" type="number" min="1" step="1" value="1000"></label>
               <label>Maximum bid/ask spread (%)<input name="maxSpreadPct" type="number" min="0.01" max="100" step="0.01" value="2"></label>
-            </div>
-            <p class="note" id="auto-trade-help">Risk boxes start blank and must be configured before any entry. Suggested option-liquidity starting filters: OI ≥ 1,000 and bid/ask spread ≤ 2%; adjust to your preference.</p>
+              </div>
+              <p class="note" id="auto-trade-help">A zero stop or target disables only that price trigger. Every bot-managed position is scheduled for square-off at 14:58 IST. Percentage risk is measured from the option premium at entry. Suggested liquidity starting filters: OI ≥ 1,000 and bid/ask spread ≤ 2%.</p>
           <p class="note" id="auto-trade-readiness" aria-live="polite">Connect and verify Dhan before enabling Auto trade.</p>
           <button id="save-settings" type="submit">Save settings</button>
         </form>
         <div class="control-facts">
-          <div><span>Risk basis</span><strong>INR per position</strong></div>
-          <div><span>Daily loss</span><strong>This bot only</strong></div>
+          <div><span>Risk basis</span><strong>INR or premium %</strong></div>
           <div><span>New entries</span><strong>Weekdays 09:45–14:00 IST</strong></div>
-          <div><span>Paper exit</span><strong>15:15 IST</strong></div>
+          <div><span>Bot square-off</span><strong>14:58 IST</strong></div>
           <div><span>Live orders</span><strong>Dhan static IP required</strong></div>
         </div>
       </section>
@@ -544,7 +570,7 @@
             </div>
             <button id="save-settings" type="submit">Save settings</button>
           </form>
-          <p class="note">Fixed option-premium stop loss: 20%. Target: 50%. Current NSE stock F&amp;O universe; maximum five open trades. Entries: weekdays 09:45 to before 14:00 IST. Dhan requires a whitelisted static IP for live orders.</p>
+          <p class="note">Per-position exits can be entered in rupees or as a percentage of entry premium; zero disables that trigger. Bot-managed positions are scheduled to square off at 14:58 IST. Entries: weekdays 09:45 to before 14:00 IST. Dhan requires a whitelisted static IP for live orders.</p>
         </section>
 
         <section class="card">
