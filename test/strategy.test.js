@@ -8,6 +8,7 @@ const {
   calculateShortOptionRisk,
   chooseOptionExpiry,
   rankLiquidInstruments,
+  meetsOptionLiquidity,
   deriveFnoEquityInstruments,
   istDate,
   isEntryWindowOpen
@@ -62,29 +63,41 @@ test('requires all bearish confirmation conditions', () => {
   }), 'SELL');
 });
 
-test('calculates fixed 20% stop loss and 50% target for short option premium', () => {
-  assert.deepEqual(calculateShortOptionRisk(100, 0.05), {
+test('calculates short-option stop and target from configured INR risk', () => {
+  assert.deepEqual(calculateShortOptionRisk(100, 0.05, 10, 200, 500), {
     stopLossPrice: 120,
     targetPrice: 50
   });
+  assert.throws(() => calculateShortOptionRisk(100, 0.05, 10, null, 500), /Configure positive stop loss/);
 });
 
-test('ranks NSE F&O stocks by turnover and excludes below-threshold stocks', () => {
-  const ranked = rankLiquidInstruments([
+test('keeps every NSE F&O underlying and ranks available quotes by turnover', () => {
+  const instruments = [
     { symbol: 'LOW', securityId: '1' },
     { symbol: 'HIGH', securityId: '2' },
     { symbol: 'EDGE', securityId: '3' },
     { symbol: 'NO_QUOTE', securityId: '4' }
-  ], {
+  ];
+  const quotes = {
     NSE_EQ: {
       1: { volume: 1000000, average_price: 20 },
       2: { volume: 1000000, average_price: 100 },
       3: { volume: 500000, average_price: 100 }
     }
-  });
+  };
+  const ranked = rankLiquidInstruments(instruments, quotes);
 
-  assert.deepEqual(ranked.map((row) => row.symbol), ['HIGH', 'EDGE']);
-  assert.deepEqual(ranked.map((row) => row.turnover), [100000000, 50000000]);
+  assert.deepEqual(ranked.map((row) => row.symbol), ['HIGH', 'EDGE', 'LOW', 'NO_QUOTE']);
+  assert.deepEqual(ranked.map((row) => row.turnover), [100000000, 50000000, 20000000, 0]);
+  assert.deepEqual(rankLiquidInstruments(instruments, quotes, 50000000).map((row) => row.symbol), ['HIGH', 'EDGE']);
+});
+
+test('rejects missing option OI or invalid bid/ask data instead of coercing null to zero', () => {
+  const settings = { minOpenInterest: 1000, maxSpreadPct: 2 };
+  assert.equal(meetsOptionLiquidity({ oi: 1000, top_bid_price: 10, top_ask_price: 10 }, { minOpenInterest: null, maxSpreadPct: 0 }), false);
+  assert.equal(meetsOptionLiquidity({ oi: null, top_bid_price: 10, top_ask_price: 10.1 }, settings), false);
+  assert.equal(meetsOptionLiquidity({ oi: 1000, top_bid_price: 0, top_ask_price: 10 }, settings), false);
+  assert.equal(meetsOptionLiquidity({ oi: 1000, top_bid_price: 10, top_ask_price: 10.1 }, settings), true);
 });
 
 test('uses the next calendar-month stock option expiry during expiry week', () => {

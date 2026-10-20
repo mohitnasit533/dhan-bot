@@ -87,6 +87,11 @@
     .status { display: inline-flex; align-items: center; gap: 8px; padding: 7px 10px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); }
     .dot { width: 8px; height: 8px; border-radius: 50%; background: #77857b; }
     .status.connected .dot { background: var(--green); box-shadow: 0 0 10px #8de0a555; animation: breathe 2s infinite; }
+    .status.verified { border-color: #27d4a177; color: #d9fff2; box-shadow: 0 0 18px #27d4a126, inset 0 0 12px #27d4a10d; }
+    .status.verified .dot { position: relative; background: var(--green); box-shadow: 0 0 10px var(--green); animation: none; }
+    .status.verified .dot::after { content: ""; position: absolute; inset: -4px; border: 1px solid var(--green); border-radius: 50%; animation: verified-pulse 2s ease-out infinite; }
+    .status.verifying .dot { background: var(--cyan); box-shadow: 0 0 12px var(--cyan); animation: breathe .7s infinite; }
+    body.dhan-connected .logo { box-shadow: 0 0 24px #27d4a144; }
     .grid { display: grid; grid-template-columns: minmax(300px, 360px) minmax(0, 1fr); gap: 18px; align-items: start; }
     .stack { display: grid; gap: 18px; }
     .card { border: 1px solid #34443a; border-radius: 16px; background: linear-gradient(145deg, #1b2620f5, #151c19f5); padding: 18px; box-shadow: 0 18px 50px #0003; transition: border-color .2s ease, transform .2s ease, box-shadow .2s ease; animation: rise-in .45s both; }
@@ -140,6 +145,7 @@
     @keyframes breathe { 50% { opacity: .45; } }
     @keyframes rise-in { from { opacity: 0; transform: translateY(7px); } to { opacity: 1; transform: translateY(0); } }
     @keyframes scan-line { to { background-position: -200% 0; } }
+    @keyframes verified-pulse { 0% { opacity: .8; transform: scale(.7); } 100% { opacity: 0; transform: scale(2.2); } }
     .footer { margin: 20px 0 4px; color: var(--muted); font-size: 11px; text-align: center; }
     @media (max-width: 900px) {
       .shell { padding: 18px; }
@@ -233,6 +239,11 @@
     .dashboard-stat.sell strong { color: var(--red); }
     .dashboard-stat span { display: block; font-size: 10px; font-weight: 700; line-height: 1.2; }
     .dashboard-stat small { display: block; margin-top: 3px; color: var(--muted); font-size: 9px; }
+    .dashboard-stat:nth-child(4) strong { font-size: 16px; white-space: normal; line-height: 1.15; }
+    .dashboard-stat .pnl-positive { color: var(--green); }
+    .dashboard-stat .pnl-negative { color: var(--red); }
+    .live-banner { padding: 7px 12px; background: #ff6389; color: #19101a; text-align: center; font-size: 12px; font-weight: 800; }
+    #live-banner { margin: 0 -28px; }
     .section-heading { display: flex; align-items: end; justify-content: space-between; gap: 16px; margin: 22px 0 10px; }
     .section-heading .note { margin-top: 2px; font-size: 10px; }
     .section-heading .scan-meta { display: flex; align-items: center; gap: 12px; }
@@ -252,6 +263,18 @@
     .scanner-card th { font-size: 9px; }
     .scanner-card td { font-size: 10px; }
     .scanner-card th, .scanner-card td { padding: 9px 8px; }
+    .turnover-cell { min-width: 76px; }
+    .turnover-cell small, .price-map small { display: block; margin-top: 4px; color: var(--muted); font-size: 8px; white-space: nowrap; }
+    .turnover-track, .range-track { position: relative; height: 4px; overflow: visible; border-radius: 99px; background: #29395f; }
+    .turnover-fill { display: block; height: 100%; border-radius: inherit; background: var(--amber); }
+    .price-map { width: 132px; min-width: 132px; }
+    .range-track { width: 78px; height: 3px; margin: 3px 0 4px; }
+    .cpr-band { position: absolute; top: -1px; height: 5px; border-radius: 99px; background: #ff982e88; border: 1px solid var(--amber); }
+    .range-vwap, .range-price { position: absolute; z-index: 1; top: 50%; }
+    .range-vwap { width: 5px; height: 5px; border-radius: 50%; background: var(--green); transform: translate(-50%, -50%); }
+    .range-price { height: 10px; border-left: 1px solid #e7ecff; transform: translate(-50%, -50%); }
+    .price-map small { width: 132px; margin-top: 2px; font-size: 7px; line-height: 1.15; letter-spacing: -.02em; }
+    .mini-map { margin: 8px 0 10px; }
     .scanner-card .table-wrap, .positions-card .table-wrap { border: 1px solid #26365d; border-radius: 11px; background: #111c39; }
     .scanner-card .pill { font-size: 9px; padding: 2px 7px; }
     .scanner-card .small-button { background: var(--amber); border-color: var(--amber); color: #111629; }
@@ -293,10 +316,12 @@
     }
     @media (max-width: 600px) {
       .shell { padding: 0 13px 18px; }
+      #live-banner { margin: 0 -13px; }
       header { min-height: 54px; margin-right: -13px; margin-left: -13px; padding: 7px 13px; }
       header { align-items: center; flex-direction: row; }
       .main-nav { display: none; }
       .header-actions { width: auto; justify-content: flex-end; gap: 6px; }
+      .header-actions { flex-wrap: wrap; }
       .header-actions .status { max-width: 130px; overflow: hidden; font-size: 9px; white-space: nowrap; }
       .header-actions .switch { font-size: 9px; }
       .header-actions > label:not(.switch) { min-width: 70px !important; }
@@ -328,6 +353,7 @@
 </head>
 <body>
   <main class="shell">
+    <div id="live-banner" class="live-banner hidden" role="status">Live mode is on. Confirmed orders are sent to your Dhan account.</div>
     <header>
       <div class="brand">
         <div class="logo" aria-hidden="true">D</div>
@@ -340,10 +366,14 @@
         <a href="#signals">Signals</a><a href="#scanner">Scanner</a><a href="#positions">Positions</a><a href="#setup">Setup</a>
       </nav>
       <div class="header-actions">
-        <span id="connection-status" class="status"><span class="dot"></span><span>Checking connection</span></span>
+        <span id="connection-status" class="status" aria-live="polite" title="The local server verifies Dhan through its profile endpoint."><span class="dot"></span><span>Checking Dhan profile</span></span>
         <label class="switch" title="Refresh market scanner every second">
           <input id="scan-auto-refresh" type="checkbox" role="switch">
           <span>Auto scan</span>
+        </label>
+        <label class="switch" title="Automatically enter confirmed signals">
+          <input id="auto-trade-toggle" type="checkbox" role="switch">
+          <span>Auto trade</span>
         </label>
         <label style="min-width:130px">
           <span>Trading mode</span>
@@ -383,6 +413,10 @@
           <label>Access token
             <input name="accessToken" type="password" autocomplete="off" required minlength="20" maxlength="4096" placeholder="Paste access token">
           </label>
+          <label class="switch">
+            <input name="rememberCredentials" type="checkbox" role="switch" checked>
+            <span>Save verified credentials to this computer for auto-renewal</span>
+          </label>
           <div class="inline">
             <button class="primary" type="submit">Connect</button>
             <button id="disconnect-button" type="button" class="danger hidden">Disconnect</button>
@@ -395,7 +429,7 @@
     <section class="dashboard-stats" aria-label="Trading overview">
       <div class="dashboard-stat buy"><strong id="buy-count">—</strong><div><span>Bullish signals</span><small>Sell put setups</small></div></div>
       <div class="dashboard-stat sell"><strong id="sell-count">—</strong><div><span>Bearish signals</span><small>Sell call setups</small></div></div>
-      <div class="dashboard-stat"><strong id="position-count">0 / 5</strong><div><span>Open positions</span><small id="positions-mode">Paper positions</small></div></div>
+      <div class="dashboard-stat"><strong id="position-count">0 / 5</strong><div><span>Open positions</span><small id="positions-mode">Paper positions</small><small id="running-pnl" aria-live="polite">Open P&amp;L —</small></div></div>
       <div class="dashboard-stat"><strong id="trade-mode-label">Manual</strong><div><span>Entry mode</span><small>Change in Setup</small></div></div>
       <div class="dashboard-stat"><strong id="entry-state">—</strong><div><span>Entry window</span><small>Weekdays · IST</small></div></div>
     </section>
@@ -409,13 +443,13 @@
     </section>
 
     <section id="scanner">
-      <div class="section-heading"><div><h2>All liquid stocks</h2><p class="note">Current NSE F&amp;O stocks ranked by traded value.</p></div>
+      <div class="section-heading"><div><h2>All NSE F&amp;O stocks</h2><p class="note">Every current NSE stock F&amp;O underlying, ranked by traded value.</p></div>
         <label class="note" for="scanner-filter">Filter stocks<input id="scanner-filter" type="search" placeholder="Search symbol" autocomplete="off"></label>
       </div>
       <section class="card scanner-card" id="scanner-card">
         <div class="table-wrap"><table>
-          <thead><tr><th>Stock</th><th>Turnover (₹ Cr)</th><th>Price</th><th>EMA 21 / 34</th><th>VWAP</th><th>CPR</th><th>Trend</th><th>Signal</th><th>Setup</th><th>Action</th></tr></thead>
-          <tbody id="scanner-body"><tr><td colspan="10" class="empty">Connect Dhan to see scanner results.</td></tr></tbody>
+          <thead><tr><th>Stock</th><th>Turnover (₹ Cr)</th><th>Price</th><th>Price vs CPR and VWAP</th><th>EMA 21 / 34</th><th>Trend</th><th>Signal</th><th>Setup</th><th>Action</th></tr></thead>
+              <tbody id="scanner-body"><tr><td colspan="9" class="empty">Connect Dhan to see scanner results.</td></tr></tbody>
         </table></div>
       </section>
     </section>
@@ -423,8 +457,8 @@
     <section id="positions" class="positions-card">
       <div class="card-head"><div><h2>Open positions</h2><p class="note">Track where the option price sits between your target and stop.</p></div></div>
       <div class="table-wrap"><table>
-        <thead><tr><th>Symbol</th><th>Position</th><th>Qty</th><th>Entry</th><th>Current</th><th>P&amp;L %</th><th>Stop / Target</th><th></th></tr></thead>
-        <tbody id="positions-body"><tr><td colspan="8" class="empty">No open paper positions.</td></tr></tbody>
+        <thead><tr><th>Symbol</th><th>Position</th><th>Qty</th><th>Entry</th><th>Current</th><th>P&amp;L %</th><th>P&amp;L (₹)</th><th>Stop / Target</th><th></th></tr></thead>
+        <tbody id="positions-body"><tr><td colspan="9" class="empty">No open paper positions.</td></tr></tbody>
       </table></div>
     </section>
 
@@ -436,13 +470,20 @@
             <label>Lots<input name="lots" type="number" min="1" max="1000" step="1" value="1" required></label>
             <label>Max positions<input name="maxTrades" type="number" min="1" max="5" step="1" value="5" required></label>
           </div>
-          <label class="switch"><input name="autoTrade" type="checkbox" role="switch"><span>Auto trade</span></label>
-          <p class="note" id="auto-trade-help">Off: review each setup and confirm entries. On: paper signals are simulated; live signals may place orders automatically.</p>
+          <div class="two-col">
+            <label>Daily max loss (₹)<input name="maxDailyLossInr" type="number" min="0.01" step="0.01" placeholder="Required before trading"></label>
+            <label>Stop loss per position (₹)<input name="stopLossInr" type="number" min="0.01" step="0.01" placeholder="Required before trading"></label>
+            <label>Profit target per position (₹)<input name="targetInr" type="number" min="0.01" step="0.01" placeholder="Required before trading"></label>
+              <label>Minimum option OI<input name="minOpenInterest" type="number" min="1" step="1" value="1000"></label>
+              <label>Maximum bid/ask spread (%)<input name="maxSpreadPct" type="number" min="0.01" max="100" step="0.01" value="2"></label>
+            </div>
+            <p class="note" id="auto-trade-help">Risk boxes start blank and must be configured before any entry. Suggested option-liquidity starting filters: OI ≥ 1,000 and bid/ask spread ≤ 2%; adjust to your preference.</p>
+          <p class="note" id="auto-trade-readiness" aria-live="polite">Connect and verify Dhan before enabling Auto trade.</p>
           <button id="save-settings" type="submit">Save settings</button>
         </form>
         <div class="control-facts">
-          <div><span>Stop loss</span><strong>20% above entry premium</strong></div>
-          <div><span>Target</span><strong>Premium falls to 50%</strong></div>
+          <div><span>Risk basis</span><strong>INR per position</strong></div>
+          <div><span>Daily loss</span><strong>This bot only</strong></div>
           <div><span>New entries</span><strong>Weekdays 09:45–14:00 IST</strong></div>
           <div><span>Paper exit</span><strong>15:15 IST</strong></div>
           <div><span>Live orders</span><strong>Dhan static IP required</strong></div>

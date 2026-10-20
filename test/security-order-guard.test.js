@@ -6,7 +6,16 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { isAllowedLocalHost, isSameOriginRequest } = require('../local-security');
-const { findActiveSuperOrder, isTerminalSuperOrder, findReconciledOrder } = require('../live-order-guard');
+const {
+  findActiveSuperOrder,
+  findActiveRegularOrder,
+  isActiveRegularOrder,
+  isTerminalRegularOrder,
+  isTerminalSuperOrder,
+  findReconciledOrder,
+  isReconciledOrderTerminal,
+  countLiveExposure
+} = require('../live-order-guard');
 const { createAutoSignalStore } = require('../auto-signal-store');
 
 test('local API host check accepts loopback names and rejects remote or malformed hosts', () => {
@@ -34,6 +43,33 @@ test('pending and partially filled Dhan orders block another order for the same 
   assert.equal(findActiveSuperOrder(orders, 'INFY'), undefined);
 });
 
+test('active regular Dhan orders block another order for the same underlying', () => {
+  const orders = [
+    { tradingSymbol: 'RELIANCE 30 JUN 2800 PE', orderStatus: 'PENDING' },
+    { tradingSymbol: 'INFY 30 JUN 1500 CE', orderStatus: 'PART_TRADED' },
+    { tradingSymbol: 'TCS 30 JUN 3200 CE', orderStatus: 'CANCELLED' }
+  ];
+
+  assert.equal(findActiveRegularOrder(orders, 'RELIANCE').orderStatus, 'PENDING');
+  assert.equal(findActiveRegularOrder(orders, 'INFY').orderStatus, 'PART_TRADED');
+  assert.equal(findActiveRegularOrder(orders, 'TCS'), undefined);
+  assert.equal(isActiveRegularOrder({ orderStatus: 'TRANSIT' }), true);
+  assert.equal(isTerminalRegularOrder({ orderStatus: 'TRADED' }), true);
+});
+
+test('live exposure counts pending regular orders and deduplicates symbols', () => {
+  const underlyings = new Set(['RELIANCE', 'TCS', 'INFY']);
+  const positions = [{ tradingSymbol: 'RELIANCE 30 JUN 2800 PE', netQty: 25 }];
+  const superOrders = [{ tradingSymbol: 'RELIANCE 30 JUN 2800 PE', orderStatus: 'PENDING' }];
+  const regularOrders = [
+    { tradingSymbol: 'TCS 30 JUN 3200 CE', orderStatus: 'PENDING' },
+    { tradingSymbol: 'INFY 30 JUN 1500 CE', orderStatus: 'TRADED' }
+  ];
+  const locks = new Map([['TCS', { state: 'checking' }]]);
+
+  assert.equal(countLiveExposure(positions, superOrders, regularOrders, locks, underlyings), 2);
+});
+
 test('live reservation is reconciled only after Dhan reports a terminal order state', () => {
   const reservation = { correlationId: 'desk-123' };
   const pending = [{ correlationId: 'desk-123', orderStatus: 'PENDING' }];
@@ -41,6 +77,25 @@ test('live reservation is reconciled only after Dhan reports a terminal order st
   assert.equal(isTerminalSuperOrder(findReconciledOrder(pending, reservation)), false);
   assert.equal(isTerminalSuperOrder(findReconciledOrder(closed, reservation)), true);
   assert.equal(findReconciledOrder([], reservation), undefined);
+});
+
+test('regular-order reservations remain held until their matching order is terminal', () => {
+  const reservation = { orderId: 'regular-123' };
+  const pending = [{ orderId: 'regular-123', orderStatus: 'PART_TRADED' }];
+  const terminal = [{ orderId: 'regular-123', orderStatus: 'CANCELLED' }];
+
+  assert.equal(isTerminalRegularOrder(findReconciledOrder(pending, reservation)), false);
+  assert.equal(isTerminalRegularOrder(findReconciledOrder(terminal, reservation)), true);
+});
+
+test('reconciliation keeps a reservation while any matching order remains active', () => {
+  const reservation = { correlationId: 'desk-456' };
+  const superOrders = [{ correlationId: 'desk-456', orderStatus: 'PENDING' }];
+  const regularOrders = [{ correlationId: 'desk-456', orderStatus: 'CANCELLED' }];
+
+  assert.equal(isReconciledOrderTerminal(superOrders, regularOrders, reservation), false);
+  assert.equal(isReconciledOrderTerminal([], regularOrders, reservation), true);
+  assert.equal(isReconciledOrderTerminal([], [], reservation), false);
 });
 
 test('auto-trade signal deduplication survives a server restart', (context) => {

@@ -4,9 +4,9 @@ const { parse } = require('csv-parse/sync');
 
 const API_BASE = 'https://api.dhan.co/v2';
 const SCRIP_MASTER_URL = 'https://images.dhan.co/api-data/api-scrip-master.csv';
-const MIN_DAILY_TURNOVER = 50000000;
 
 let credentials = null;
+let connectionVerification = { verified: false, verifiedAt: null, error: null };
 let scripMasterPromise = null;
 let quoteCache = { fetchedAt: 0, quotes: null, key: '' };
 let lastCandleRequestAt = 0;
@@ -68,11 +68,15 @@ async function connect(clientId, accessToken) {
   const profile = result.data || result;
   const profileClientId = String(profile.dhanClientId || profile.clientId || '').trim();
 
-  if (profileClientId && profileClientId !== normalizedClientId) {
+  if (!profileClientId) {
+    throw new Error('Dhan profile verification did not return a Client ID.');
+  }
+  if (profileClientId !== normalizedClientId) {
     throw new Error('The token belongs to a different Dhan Client ID.');
   }
 
   credentials = { clientId: normalizedClientId, accessToken: normalizedToken, profile };
+  connectionVerification = { verified: true, verifiedAt: new Date().toISOString(), error: null };
   scripMasterPromise = null;
   scripMasterFetchedAt = 0;
   equityInstrumentsCache = null;
@@ -83,6 +87,30 @@ async function connect(clientId, accessToken) {
   candleCache.clear();
   indicatorCache.clear();
   return publicProfile(profile);
+}
+
+async function verifyConnection() {
+  requireConnection();
+  try {
+    const result = await requestDhan('/profile');
+    const profile = result.data || result;
+    const profileClientId = String(profile.dhanClientId || profile.clientId || '').trim();
+    if (!profileClientId || profileClientId !== credentials.clientId) {
+      throw new Error(profileClientId
+        ? 'The verified profile belongs to a different Dhan Client ID.'
+        : 'Dhan profile verification did not return a Client ID.');
+    }
+    credentials.profile = profile;
+    connectionVerification = { verified: true, verifiedAt: new Date().toISOString(), error: null };
+    return publicProfile(profile);
+  } catch (error) {
+    connectionVerification = { verified: false, verifiedAt: new Date().toISOString(), error: error.message };
+    throw error;
+  }
+}
+
+function getConnectionVerification() {
+  return { ...connectionVerification };
 }
 
 async function renewAccessToken() {
@@ -135,6 +163,7 @@ function getConnection() {
 
 function disconnect() {
   credentials = null;
+  connectionVerification = { verified: false, verifiedAt: null, error: null };
   quoteCache = { fetchedAt: 0, quotes: null, key: '' };
   candleCache.clear();
   indicatorCache.clear();
@@ -153,6 +182,12 @@ async function getPositions() {
 async function getSuperOrders() {
   requireConnection();
   const result = await requestDhan('/super/orders');
+  return Array.isArray(result.data) ? result.data : (Array.isArray(result) ? result : []);
+}
+
+async function getOrders() {
+  requireConnection();
+  const result = await requestDhan('/orders');
   return Array.isArray(result.data) ? result.data : (Array.isArray(result) ? result : []);
 }
 
@@ -182,7 +217,22 @@ function chooseOptionExpiry(expiries, today = new Date()) {
   if (daysToExpiry > 7) return currentMonthlyExpiry;
   return monthlyExpiries.find((value) => value.slice(0, 7) > currentMonth && value >= todayDate) || null;
 }
-async function getOptionData(underlying, signal) {
+
+function meetsOptionLiquidity(contract, settings = {}) {
+  const oi = Number(contract?.oi ?? contract?.open_interest);
+  const bid = Number(contract?.top_bid_price);
+  const ask = Number(contract?.top_ask_price);
+  const minimumOi = Number(settings.minOpenInterest);
+  const maximumSpreadPct = Number(settings.maxSpreadPct);
+  if (![oi, bid, ask, minimumOi, maximumSpreadPct].every(Number.isFinite)
+    || minimumOi <= 0 || maximumSpreadPct <= 0
+    || oi < minimumOi || bid <= 0 || ask < bid) return false;
+  const midpoint = (bid + ask) / 2;
+  const spreadPct = ((ask - bid) / midpoint) * 100;
+  return spreadPct <= maximumSpreadPct;
+}
+
+async function getOptionData(underlying, signal, liquiditySettings = {}) {
   const instruments = await getEquityInstruments();
   const instrument = instruments.find((item) => item.symbol === underlying);
   if (!instrument) throw new Error('Unsupported underlying symbol.');
@@ -213,9 +263,12 @@ async function getOptionData(underlying, signal) {
   })).filter((item) => item.contract?.security_id
     && Number(item.contract.last_price) > 0
     && Number.isFinite(Number(item.contract.greeks?.delta))
-    && (signal === 'BUY' ? Number(item.contract.greeks.delta) < 0 : Number(item.contract.greeks.delta) > 0));
+    && (signal === 'BUY' ? Number(item.contract.greeks.delta) < 0 : Number(item.contract.greeks.delta) > 0)
+    && meetsOptionLiquidity(item.contract, liquiditySettings));
 
-  if (!candidates.length) throw new Error(`Dhan returned no ${desiredOption.toUpperCase()} contracts for ${underlying}.`);
+  if (!candidates.length) {
+    throw new Error(`No ${desiredOption.toUpperCase()} contract for ${underlying} met the configured OI and bid/ask spread limits.`);
+  }
 
   const selected = candidates.reduce((best, item) => Math.abs(Number(item.contract.greeks.delta) - desiredDelta)
     < Math.abs(Number(best.contract.greeks.delta) - desiredDelta) ? item : best);
@@ -241,45 +294,59 @@ async function getOptionData(underlying, signal) {
     lotUnits,
     tickSize,
     entryPrice,
+    openInterest: Number(selected.contract.oi ?? selected.contract.open_interest),
+    bidPrice: Number(selected.contract.top_bid_price),
+    askPrice: Number(selected.contract.top_ask_price),
     greeks: selected.contract.greeks || null,
     optionLtp: Number(selected.contract.last_price),
     spotPrice: Number(chain.last_price)
   };
 }
 
-async function createOptionOrderPreview({ symbol, signal, lots, includeMargin = true }) {
+async function checkOrderMargin(order) {
+  requireConnection();
+  const result = await requestDhan('/margincalculator', {
+    method: 'POST',
+    body: JSON.stringify({
+      dhanClientId: credentials.clientId,
+      exchangeSegment: order.exchangeSegment,
+      transactionType: order.transactionType,
+      quantity: order.quantity,
+      productType: order.productType,
+      securityId: order.securityId,
+      price: order.price,
+      triggerPrice: 0
+    })
+  });
+  const margin = result.data || {};
+  const funds = await getFunds();
+  const required = Number(margin.totalMargin);
+  const available = Number(funds.availabelBalance ?? funds.availableBalance);
+  if (margin.insufficientBalance === true || String(margin.insufficientBalance).toLowerCase() === 'true') {
+    throw new Error('Dhan reports insufficient available funds for this order.');
+  }
+  if (!Number.isFinite(required) || required < 0 || !Number.isFinite(available) || available < required) {
+    throw new Error('Could not confirm sufficient available funds for the estimated Dhan margin. Live order blocked.');
+  }
+  return { ...margin, availableFunds: available, sufficient: true };
+}
+
+async function createOptionOrderPreview({ symbol, signal, lots, includeMargin = true, riskSettings = {} }) {
   requireConnection();
   const supportedSymbols = new Set((await getEquityInstruments()).map((instrument) => instrument.symbol));
   if (!supportedSymbols.has(symbol) || !['BUY', 'SELL'].includes(signal)) {
     throw new Error('Choose a supported symbol with a confirmed BUY or SELL signal.');
   }
-  const stopLossPct = 20;
-  const targetPct = 50;
   if (!Number.isInteger(lots) || lots < 1 || lots > 1000) {
     throw new Error('Lot size must be 1-1000.');
   }
 
-  const contract = await getOptionData(symbol, signal);
+  const contract = await getOptionData(symbol, signal, riskSettings);
   const quantity = lots * contract.lotUnits;
-  const { stopLossPrice, targetPrice } = calculateShortOptionRisk(contract.entryPrice, contract.tickSize);
-
-  let margin = {};
-  if (includeMargin) {
-    const marginResult = await requestDhan('/margincalculator', {
-      method: 'POST',
-      body: JSON.stringify({
-        dhanClientId: credentials.clientId,
-        exchangeSegment: 'NSE_FNO',
-        transactionType: 'SELL',
-        quantity,
-        productType: 'INTRADAY',
-        securityId: contract.securityId,
-        price: contract.entryPrice,
-        triggerPrice: 0
-      })
-    });
-    margin = marginResult.data || {};
-  }
+  const { stopLossPrice, targetPrice } = calculateShortOptionRisk(
+    contract.entryPrice, contract.tickSize, quantity,
+    riskSettings.stopLossInr, riskSettings.targetInr
+  );
 
   const order = {
     dhanClientId: credentials.clientId,
@@ -296,10 +363,11 @@ async function createOptionOrderPreview({ symbol, signal, lots, includeMargin = 
     stopLossPrice,
     trailingJump: 0
   };
+  const margin = includeMargin ? await checkOrderMargin(order) : {};
 
   return {
     order,
-    risk: { stopLossPct, targetPct },
+    risk: { stopLossInr: Number(riskSettings.stopLossInr), targetInr: Number(riskSettings.targetInr) },
     underlying: contract.underlying,
     signal,
     preview: {
@@ -313,9 +381,12 @@ async function createOptionOrderPreview({ symbol, signal, lots, includeMargin = 
       'Total quantity': quantity,
       'Limit price': contract.entryPrice,
       'Order notional': (quantity * contract.entryPrice).toFixed(2),
+      'Open interest': contract.openInterest,
+      'Bid/ask spread (%)': (((contract.askPrice - contract.bidPrice) / ((contract.askPrice + contract.bidPrice) / 2)) * 100).toFixed(2),
       'Stop loss price': stopLossPrice,
       'Target price': targetPrice,
       'Estimated margin': margin.totalMargin ?? 'Unavailable',
+      'Available funds': margin.availableFunds ?? 'Not checked',
       'Trailing stop': 'Not exchange-managed; live trailing activation is not enabled'
     },
     warning: 'Short stock options can lose substantially more than the premium received. Verify the signal, option side, expiry, and risk before confirming.'
@@ -554,10 +625,24 @@ function confirmedSignal({ crossedUp, crossedDown, trend, close, vwap, cpr }) {
   return 'WATCH';
 }
 
-function calculateShortOptionRisk(entryPrice, tickSize) {
+function calculateShortOptionRisk(entryPrice, tickSize, quantity, stopLossInr, targetInr) {
+  quantity = Number(quantity);
+  stopLossInr = Number(stopLossInr);
+  targetInr = Number(targetInr);
+  if (!Number.isFinite(entryPrice) || entryPrice <= 0 || !Number.isFinite(quantity) || quantity <= 0
+    || !Number.isFinite(stopLossInr) || stopLossInr <= 0
+    || !Number.isFinite(targetInr) || targetInr <= 0) {
+    throw new Error('Configure positive stop loss and profit target amounts in INR before trading.');
+  }
+  if (targetInr >= entryPrice * quantity) {
+    throw new Error('Profit target must be less than the option premium received for this position.');
+  }
+  const tick = Number(tickSize) || 0.05;
+  const stopTicks = Math.ceil(((entryPrice + stopLossInr / quantity) / tick) - 1e-9);
+  const targetTicks = Math.floor(((entryPrice - targetInr / quantity) / tick) + 1e-9);
   return {
-    stopLossPrice: roundToTick(entryPrice * 1.2, tickSize),
-    targetPrice: roundToTick(Math.max(tickSize, entryPrice * 0.5), tickSize)
+    stopLossPrice: Number((stopTicks * tick).toFixed(2)),
+    targetPrice: Number((Math.max(1, targetTicks) * tick).toFixed(2))
   };
 }
 
@@ -601,13 +686,15 @@ function calculateIndicators(candles) {
   };
 }
 
-function rankLiquidInstruments(instruments, quotes, minTurnover = MIN_DAILY_TURNOVER) {
+function rankLiquidInstruments(instruments, quotes, minTurnover = 0) {
   return instruments.map((instrument) => {
     const quote = quotes.NSE_EQ?.[instrument.securityId];
     const volume = Number(quote?.volume);
     const averagePrice = Number(quote?.average_price);
     const lastPrice = Number(quote?.last_price);
-    const turnover = volume * (averagePrice > 0 ? averagePrice : lastPrice);
+    const turnover = Number.isFinite(volume) && volume > 0
+      ? volume * (averagePrice > 0 ? averagePrice : Number.isFinite(lastPrice) ? lastPrice : 0)
+      : 0;
     return { ...instrument, quote, turnover };
   }).filter((instrument) => Number.isFinite(instrument.turnover) && instrument.turnover >= minTurnover)
     .sort((left, right) => right.turnover - left.turnover || left.symbol.localeCompare(right.symbol));
@@ -654,27 +741,31 @@ async function getLiveScan(optionSecurityIds = []) {
       trend: indicators?.trend || 'Unavailable',
       setup: indicators?.signal === 'BUY' ? 'SELL PUT' : indicators?.signal === 'SELL' ? 'SELL CALL' : 'WAIT',
       lastCandleAt: indicators?.lastCandleAt || null,
-      dataError,
-      dataState: !candleRecord ? 'LOADING' : candleAge >= 15 * 60 * 1000 ? 'REFRESHING' : indicators ? 'READY' : 'UNAVAILABLE'
+      dataError: !Number.isFinite(price) || price <= 0 ? 'Current cash quote unavailable' : dataError,
+      dataState: !Number.isFinite(price) || price <= 0 ? 'UNAVAILABLE' : !candleRecord ? 'LOADING' : candleAge >= 15 * 60 * 1000 ? 'REFRESHING' : indicators ? 'READY' : 'UNAVAILABLE'
     });
   }
   return {
     results: rows,
     optionQuotes: quotes.NSE_FNO || {},
     scannedUniverse: instruments.length,
-    liquidityThreshold: MIN_DAILY_TURNOVER,
+    liquidityThreshold: null,
     quotesUpdatedAt: quoteCache.fetchedAt ? new Date(quoteCache.fetchedAt).toISOString() : null
   };
 }
 
 module.exports = {
   connect,
+  verifyConnection,
+  getConnectionVerification,
   renewAccessToken,
   disconnect,
   getConnection,
   getPositions,
   getSuperOrders,
+  getOrders,
   getFunds,
+  checkOrderMargin,
   getLiveScan,
   createOptionOrderPreview,
   placeSuperOrder,
@@ -686,6 +777,7 @@ module.exports = {
   isEntryWindowOpen,
   calculatePreviousDayCpr,
   confirmedSignal,
-  calculateShortOptionRisk
+  calculateShortOptionRisk,
+  meetsOptionLiquidity
 };
 'use strict';

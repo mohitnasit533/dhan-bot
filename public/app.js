@@ -5,8 +5,12 @@ const notice = $('#notice');
 let activePreviewId = null;
 let currentMode = 'PAPER';
 let connected = false;
+let verifiedProfile = null;
 let scannerRefreshInFlight = false;
+let connectionRefreshInFlight = false;
 let autoTradeEnabled = false;
+let riskSettingsReady = false;
+let missingRiskSettings = [];
 let maxOpenTrades = 5;
 let latestScannerResults = [];
 let scannerRenderSignature = '';
@@ -14,6 +18,25 @@ let scannerRenderSignature = '';
 function showNotice(message, kind = '') {
   notice.textContent = message || '';
   notice.className = message ? `notice show ${kind}` : 'notice';
+}
+
+function updateAutoTradeAvailability() {
+  const toggle = $('#auto-trade-toggle');
+  const ready = connected && riskSettingsReady;
+  const missing = missingRiskSettings.length
+    ? missingRiskSettings.join(', ')
+    : 'daily max loss, stop loss, and profit target';
+  toggle.disabled = !ready && !autoTradeEnabled;
+  toggle.title = ready
+    ? 'Automatically enter confirmed signals. Live mode can place real orders.'
+    : !connected
+      ? 'Connect and verify Dhan before enabling automatic signal handling.'
+      : `Save positive risk values before enabling Auto trade: ${missing}.`;
+  $('#auto-trade-readiness').textContent = !connected
+    ? 'Auto trade is locked until this server verifies your Dhan profile.'
+    : !riskSettingsReady
+      ? `Auto trade is locked until these controls are saved: ${missing}.`
+      : 'Ready. Paper mode simulates signals; Live mode can submit real Dhan orders without per-order confirmation.';
 }
 
 function updateScanIndicator(busy = false) {
@@ -43,41 +66,110 @@ function formatPrice(value) {
     : '—';
 }
 
+function formatRupees(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return '—';
+  return `${number >= 0 ? '+' : '−'}₹${Math.abs(number).toLocaleString('en-IN', { maximumFractionDigits: 2 })}`;
+}
+
 function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>"']/g, (character) => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
   })[character]);
 }
 
-function setConnected(value, profile, tokenRenewal) {
+function rangePercent(value, minimum, maximum) {
+  return Math.min(97, Math.max(3, ((value - minimum) / (maximum - minimum)) * 100));
+}
+
+function priceMapMarkup(row, compact = false) {
+  const values = [row.price, row.vwap, row.cpr?.top, row.cpr?.bottom]
+    .map(Number).filter((value) => Number.isFinite(value) && value > 0);
+  if (values.length < 2 || !Number.isFinite(Number(row.price)) || !Number.isFinite(Number(row.vwap))
+    || !Number.isFinite(Number(row.cpr?.top)) || !Number.isFinite(Number(row.cpr?.bottom))) {
+    return '<span class="muted">Price vs CPR/VWAP unavailable</span>';
+  }
+  const low = Math.min(...values);
+  const high = Math.max(...values);
+  const padding = Math.max((high - low) * 0.18, high * 0.001);
+  const minimum = low - padding;
+  const maximum = high + padding;
+  const left = rangePercent(Math.min(row.cpr.top, row.cpr.bottom), minimum, maximum);
+  const right = rangePercent(Math.max(row.cpr.top, row.cpr.bottom), minimum, maximum);
+  const price = rangePercent(Number(row.price), minimum, maximum);
+  const vwap = rangePercent(Number(row.vwap), minimum, maximum);
+  const label = `VWAP ${formatPrice(row.vwap)} · CPR ${row.cpr.narrow ? 'narrow' : 'wide'} ${Number(row.cpr.widthPct).toFixed(2)}%`;
+  return `<div class="price-map${compact ? ' mini-map' : ''}" aria-label="${escapeHtml(label)}">
+    <div class="range-track"><span class="cpr-band" style="left:${left.toFixed(1)}%;width:${Math.max(2, right - left).toFixed(1)}%"></span><i class="range-vwap" style="left:${vwap.toFixed(1)}%"></i><i class="range-price" style="left:${price.toFixed(1)}%"></i></div>
+    ${compact ? '' : `<small>${escapeHtml(label)}</small>`}
+  </div>`;
+}
+
+function positionPnlInr(trade) {
+  const reported = Number(trade.pnlInr ?? trade.unrealizedProfit ?? trade.unrealized_profit ?? trade.unrealizedPnl);
+  if (Number.isFinite(reported)) return reported;
+  const entry = Number(trade.entryPrice ?? trade.averagePrice ?? trade.costPrice);
+  const current = Number(trade.currentPrice ?? trade.lastPrice ?? trade.ltp);
+  const quantity = Number(trade.quantity ?? trade.netQty);
+  if (![entry, current, quantity].every(Number.isFinite) || entry <= 0 || quantity === 0) return null;
+  return (current - entry) * Math.abs(quantity) * (quantity < 0 || String(trade.side || '').startsWith('SELL') ? -1 : 1);
+}
+
+function setConnected(value, profile, tokenRenewal, verification = {}) {
   connected = value;
+  verifiedProfile = connected ? profile : null;
   const status = $('#connection-status');
   status.classList.toggle('connected', connected);
-  status.lastElementChild.textContent = connected ? `Connected${profile?.name ? ` · ${profile.name}` : ''}` : 'Not connected';
+  status.classList.toggle('verified', connected && verification.verified !== false);
+  status.classList.toggle('verifying', false);
+  status.lastElementChild.textContent = connected ? `Dhan verified${profile?.name ? ` · ${profile.name}` : ''}` : 'Not verified';
+  status.title = connected
+    ? `Dhan /profile verified${verification.checkedAt ? ` at ${new Date(verification.checkedAt).toLocaleTimeString()}` : ''}.`
+    : verification.error || 'This local server has not verified a Dhan profile.';
+  document.body.classList.toggle('dhan-connected', connected);
   $('#disconnect-button').classList.toggle('hidden', !connected);
   const form = $('#connect-form');
   form.querySelectorAll('label, button[type="submit"]').forEach((element) => {
     element.classList.toggle('hidden', connected);
   });
   $('#connection-info').textContent = connected
-    ? `Client ID ${profile?.clientId || ''}. ${tokenRenewal?.message || 'Credentials remain on this computer.'}`
-    : 'Credentials are sent only to this local server.';
+    ? `Verified by Dhan /profile for Client ID ${profile?.clientId || ''}. ${tokenRenewal?.message || 'Credentials remain on this computer.'}`
+    : verification.error
+      ? `Dhan profile verification failed: ${verification.error}`
+      : 'No Dhan profile is currently verified by this local server. Credentials are sent only to this computer.';
 }
 
-async function refreshConnection() {
-  const connection = await api('/api/connection');
-  currentMode = connection.mode || 'PAPER';
-  $('#mode-select').value = currentMode;
-  $('#positions-mode').textContent = currentMode === 'PAPER' ? 'Paper positions' : 'Broker positions';
-  setConnected(connection.connected, connection.profile, connection.tokenRenewal);
-  const settings = connection.settings || {};
-  const form = $('#trade-settings');
-  form.elements.lots.value = settings.lotSize ?? 1;
-  form.elements.maxTrades.value = settings.maxTrades ?? 5;
-  maxOpenTrades = settings.maxTrades ?? 5;
-  autoTradeEnabled = Boolean(connection.autoTrade);
-  form.elements.autoTrade.checked = Boolean(connection.autoTrade);
-  $('#trade-mode-label').textContent = connection.autoTrade ? 'Auto trade' : 'Manual confirmation';
+async function refreshConnection(updateSettings = true) {
+  if (connectionRefreshInFlight) return;
+  connectionRefreshInFlight = true;
+  try {
+    const connection = await api('/api/connection');
+    currentMode = connection.mode || 'PAPER';
+    $('#mode-select').value = currentMode;
+    $('#positions-mode').textContent = currentMode === 'PAPER' ? 'Paper positions' : 'Broker positions';
+    setConnected(connection.connected, connection.profile, connection.tokenRenewal, connection.verification);
+    autoTradeEnabled = Boolean(connection.autoTrade);
+    $('#auto-trade-toggle').checked = autoTradeEnabled;
+    riskSettingsReady = Boolean(connection.riskReady);
+    missingRiskSettings = connection.missingRiskSettings || [];
+    $('#trade-mode-label').textContent = autoTradeEnabled ? 'Auto trade' : 'Manual confirmation';
+    $('#live-banner').classList.toggle('hidden', currentMode !== 'LIVE');
+    updateAutoTradeAvailability();
+    if (updateSettings) {
+      const settings = connection.settings || {};
+      const form = $('#trade-settings');
+      form.elements.lots.value = settings.lotSize ?? 1;
+      form.elements.maxTrades.value = settings.maxTrades ?? 5;
+      form.elements.maxDailyLossInr.value = settings.maxDailyLossInr ?? '';
+      form.elements.stopLossInr.value = settings.stopLossInr ?? '';
+      form.elements.targetInr.value = settings.targetInr ?? '';
+      form.elements.minOpenInterest.value = settings.minOpenInterest ?? 1000;
+      form.elements.maxSpreadPct.value = settings.maxSpreadPct ?? 2;
+      maxOpenTrades = settings.maxTrades ?? 5;
+    }
+  } finally {
+    connectionRefreshInFlight = false;
+  }
 }
 
 function renderScanner(results = []) {
@@ -90,32 +182,31 @@ function renderScanner(results = []) {
   const body = $('#scanner-body');
   const search = ($('#scanner-filter')?.value || '').trim().toUpperCase();
   const visibleResults = search ? results.filter((row) => row.symbol.includes(search)) : results;
-  renderSignalCards(visibleResults.filter((row) => ['BUY', 'SELL'].includes(row.signal)));
+  renderSignalCards(visibleResults.filter((row) => ['BUY', 'SELL'].includes(row.signal) && !row.dataError));
   if (!visibleResults.length) {
     scannerRenderSignature = '';
-    body.innerHTML = `<tr><td colspan="10" class="empty">${connected ? 'No scanner data returned.' : 'Connect Dhan to see scanner results.'}</td></tr>`;
+    body.innerHTML = `<tr><td colspan="9" class="empty">${connected ? 'No scanner data returned.' : 'Connect Dhan to see scanner results.'}</td></tr>`;
     return;
   }
   const signature = JSON.stringify(visibleResults.map((row) => [
-    row.symbol, row.turnover, row.ema21, row.ema34, row.vwap, row.cpr, row.trend, row.signal, row.setup, row.dataError
+    row.symbol, row.turnover, row.price, row.ema21, row.ema34, row.vwap, row.cpr, row.trend, row.signal, row.setup, row.dataError
   ]));
   if (signature !== scannerRenderSignature) {
+    const maxTurnover = Math.max(1, ...visibleResults.map((item) => Number(item.turnover) || 0));
     body.innerHTML = visibleResults.map((row) => {
     const signal = row.signal || 'WATCH';
     const badgeClass = signal === 'BUY' ? 'buy' : signal === 'SELL' ? 'sell' : 'watch';
-    const cpr = row.cpr
-      ? `${row.cpr.narrow ? 'Narrow' : 'Wide'} · ${Number(row.cpr.widthPct).toFixed(2)}%`
-      : 'Unavailable';
-    const action = ['BUY', 'SELL'].includes(signal)
+    const action = ['BUY', 'SELL'].includes(signal) && !row.dataError
       ? `<button class="small-button primary preview-button" data-symbol="${escapeHtml(row.symbol)}" data-signal="${escapeHtml(signal)}" type="button">Preview</button>`
       : '<span class="muted">—</span>';
+    const turnover = Number(row.turnover);
+    const turnoverWidth = Number.isFinite(turnover) && turnover > 0 ? Math.max(3, turnover / maxTurnover * 100) : 0;
     return `<tr data-symbol="${escapeHtml(row.symbol)}">
       <td><strong>${escapeHtml(row.symbol)}</strong></td>
-      <td>${Number.isFinite(Number(row.turnover)) ? (Number(row.turnover) / 10000000).toFixed(1) : '—'}</td>
+      <td class="turnover-cell">${Number.isFinite(turnover) && turnover > 0 ? `${(turnover / 10000000).toFixed(1)}<div class="turnover-track"><i class="turnover-fill" style="width:${turnoverWidth.toFixed(1)}%"></i></div>` : '—'}</td>
       <td>${formatPrice(row.price)}</td>
+      <td>${priceMapMarkup(row)}</td>
       <td>${formatPrice(row.ema21)} / ${formatPrice(row.ema34)}</td>
-      <td>${formatPrice(row.vwap)}</td>
-      <td>${escapeHtml(cpr)}</td>
       <td>${escapeHtml(row.trend || '—')}</td>
       <td><span class="pill ${badgeClass}">${escapeHtml(signal)}</span></td>
       <td>${escapeHtml(row.setup || '—')}</td>
@@ -157,6 +248,7 @@ function renderSignalCards(signals) {
     return `<article class="signal-card ${bullish ? 'buy' : 'sell'}">
       <div class="signal-title"><strong>${escapeHtml(row.symbol)}</strong><span>${formatPrice(row.price)}</span></div>
       <p class="note">${bullish ? 'Bullish: sell a put' : 'Bearish: sell a call'}</p>
+      ${priceMapMarkup(row, true)}
       <div class="signal-data">
         <div>VWAP<b>${vwapText}</b></div><div>CPR width<b>${cprText}</b></div>
         <div>EMA 21 / 34<b>${formatPrice(row.ema21)} / ${formatPrice(row.ema34)}</b></div>
@@ -172,21 +264,27 @@ function renderPositions(positions = []) {
   $('#position-count').textContent = `${positions.length} / ${maxOpenTrades}`;
   const body = $('#positions-body');
   if (!positions.length) {
-    body.innerHTML = `<tr><td colspan="8" class="empty">${currentMode === 'PAPER' ? 'No open paper positions.' : 'No open broker positions.'}</td></tr>`;
+    body.innerHTML = `<tr><td colspan="9" class="empty">${currentMode === 'PAPER' ? 'No open paper positions.' : 'No open broker positions.'}</td></tr>`;
     return;
   }
   body.innerHTML = positions.map((trade) => {
     const paperClose = currentMode === 'PAPER'
       ? `<button class="small-button danger close-button" data-symbol="${escapeHtml(trade.symbol)}" type="button">Close</button>`
       : '';
-    const pnl = Number(trade.pnlPct);
+    const pnlInr = positionPnlInr(trade);
+    const entry = Number(trade.entryPrice ?? trade.averagePrice ?? trade.costPrice);
+    const quantity = Number(trade.quantity ?? trade.netQty);
+    const pnl = Number.isFinite(Number(trade.pnlPct)) ? Number(trade.pnlPct)
+      : Number.isFinite(pnlInr) && entry > 0 && quantity !== 0 ? pnlInr / (entry * Math.abs(quantity)) * 100 : NaN;
+    const pnlClass = Number.isFinite(pnlInr) ? (pnlInr >= 0 ? 'pnl-positive' : 'pnl-negative') : '';
     return `<tr>
       <td><strong>${escapeHtml(trade.symbol || trade.tradingSymbol || trade.securityName || '—')}</strong></td>
       <td>${escapeHtml(trade.side || trade.transactionType || '—')}</td>
       <td>${escapeHtml(trade.quantity ?? trade.netQty ?? '—')}</td>
-      <td>${formatPrice(trade.entryPrice ?? trade.averagePrice)}</td>
-      <td>${formatPrice(trade.currentPrice ?? trade.lastPrice)}</td>
+      <td>${formatPrice(trade.entryPrice ?? trade.averagePrice ?? trade.costPrice)}</td>
+      <td>${formatPrice(trade.currentPrice ?? trade.lastPrice ?? trade.ltp)}</td>
       <td>${Number.isFinite(pnl) ? `${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}%` : '—'}</td>
+      <td class="${pnlClass}">${formatRupees(pnlInr)}</td>
       <td>${trade.stopPrice ? `${formatPrice(trade.stopPrice)} / ${formatPrice(trade.targetPrice)}` : '—'}</td>
       <td>${paperClose}</td>
     </tr>`;
@@ -204,6 +302,14 @@ async function refreshScanner(showErrors = true) {
     renderScanner(data.results || []);
     const positions = currentMode === 'PAPER' ? (data.activePositions || []) : (data.brokerPositions || []);
     renderPositions(positions);
+    const openPnl = positions.reduce((total, trade) => {
+      const value = positionPnlInr(trade);
+      return Number.isFinite(value) ? total + value : total;
+    }, 0);
+    const pnlElement = $('#running-pnl');
+    pnlElement.textContent = `Open P&L ${formatRupees(openPnl)}`;
+    pnlElement.classList.toggle('pnl-positive', openPnl >= 0);
+    pnlElement.classList.toggle('pnl-negative', openPnl < 0);
     $('#scanner-caption').textContent = data.connected
       ? `${data.strategy || 'Live market data'} · ${data.mode || currentMode} mode`
       : (data.message || 'Connect your account to load market data.');
@@ -224,6 +330,36 @@ async function refreshScanner(showErrors = true) {
 
 function formValues(form) {
   return Object.fromEntries(new FormData(form).entries());
+}
+
+function tradeSettingsPayload(form, enabled) {
+  const values = formValues(form);
+  const optionalNumber = (value) => value === '' ? null : Number(value);
+  return {
+    enabled,
+    lotSize: Number(values.lots),
+    maxTrades: Number(values.maxTrades),
+    maxDailyLossInr: optionalNumber(values.maxDailyLossInr),
+    stopLossInr: optionalNumber(values.stopLossInr),
+    targetInr: optionalNumber(values.targetInr),
+    minOpenInterest: optionalNumber(values.minOpenInterest),
+    maxSpreadPct: optionalNumber(values.maxSpreadPct)
+  };
+}
+
+async function saveAutoTradeSettings(enabled) {
+  const data = await api('/api/auto-trade', {
+    method: 'POST',
+    body: JSON.stringify(tradeSettingsPayload($('#trade-settings'), enabled))
+  });
+  autoTradeEnabled = data.enabled;
+  $('#auto-trade-toggle').checked = autoTradeEnabled;
+  riskSettingsReady = Boolean(data.riskReady);
+  missingRiskSettings = data.missingRiskSettings || [];
+  maxOpenTrades = data.settings.maxTrades;
+  $('#trade-mode-label').textContent = data.enabled ? 'Auto trade' : 'Manual confirmation';
+  updateAutoTradeAvailability();
+  return data;
 }
 
 function updateSessionClock() {
@@ -266,17 +402,25 @@ $('#connect-form').addEventListener('submit', async (event) => {
   const form = event.currentTarget;
   const fields = formValues(form);
   const button = form.querySelector('[type="submit"]');
+  const status = $('#connection-status');
+  status.classList.add('verifying');
+  status.lastElementChild.textContent = 'Verifying Dhan profile…';
   button.disabled = true;
   try {
+    fields.rememberCredentials = form.elements.rememberCredentials.checked;
     const data = await api('/api/connect', { method: 'POST', body: JSON.stringify(fields) });
     form.elements.accessToken.value = '';
-    setConnected(true, data.profile, data.tokenRenewal);
+    setConnected(true, data.profile, data.tokenRenewal, { verified: true });
     showNotice(data.message || 'Connected to Dhan.', 'success');
     await refreshConnection();
     await refreshScanner();
   } catch (error) {
     showNotice(error.message, 'error');
   } finally {
+    status.classList.remove('verifying');
+    status.lastElementChild.textContent = connected
+      ? `Dhan verified${verifiedProfile?.name ? ` · ${verifiedProfile.name}` : ''}`
+      : 'Not verified';
     button.disabled = false;
   }
 });
@@ -305,6 +449,7 @@ $('#mode-select').addEventListener('change', async (event) => {
     const data = await api('/api/mode', { method: 'POST', body: JSON.stringify({ mode: requestedMode }) });
     currentMode = data.mode;
     $('#positions-mode').textContent = currentMode === 'PAPER' ? 'Paper positions' : 'Broker positions';
+    $('#live-banner').classList.toggle('hidden', currentMode !== 'LIVE');
     activePreviewId = null;
     $('#preview-card').classList.add('hidden');
     showNotice(data.message, 'success');
@@ -317,22 +462,8 @@ $('#mode-select').addEventListener('change', async (event) => {
 
 $('#trade-settings').addEventListener('submit', async (event) => {
   event.preventDefault();
-  const values = formValues(event.currentTarget);
-  const payload = {
-    enabled: event.currentTarget.elements.autoTrade.checked,
-    lotSize: Number(values.lots),
-    maxTrades: Number(values.maxTrades)
-  };
-  if (payload.enabled && currentMode === 'LIVE'
-    && !confirm('Enable automatic LIVE trading? The server will place real stock-option orders when a new confirmed signal appears, without asking again for each order.')) {
-    event.currentTarget.elements.autoTrade.checked = autoTradeEnabled;
-    return;
-  }
   try {
-    const data = await api('/api/auto-trade', { method: 'POST', body: JSON.stringify(payload) });
-    autoTradeEnabled = data.enabled;
-    maxOpenTrades = data.settings.maxTrades;
-    $('#trade-mode-label').textContent = data.enabled ? 'Auto trade' : 'Manual confirmation';
+    const data = await saveAutoTradeSettings(autoTradeEnabled);
     if (data.enabled) {
       $('#scan-auto-refresh').checked = true;
       try {
@@ -343,6 +474,32 @@ $('#trade-settings').addEventListener('submit', async (event) => {
     showNotice(data.message, 'success');
   } catch (error) {
     showNotice(error.message, 'error');
+  }
+});
+
+$('#auto-trade-toggle').addEventListener('change', async (event) => {
+  const enabled = event.currentTarget.checked;
+  if (enabled && currentMode === 'LIVE'
+    && !confirm('Enable automatic LIVE trading? Confirmed signals can place real Dhan orders without per-order confirmation.')) {
+    event.currentTarget.checked = autoTradeEnabled;
+    return;
+  }
+  event.currentTarget.disabled = true;
+  try {
+    const data = await saveAutoTradeSettings(enabled);
+    if (enabled) {
+      $('#scan-auto-refresh').checked = true;
+      try {
+        localStorage.setItem('dhan-auto-scan', 'true');
+      } catch {}
+      await refreshScanner();
+    }
+    showNotice(data.message, 'success');
+  } catch (error) {
+    event.currentTarget.checked = autoTradeEnabled;
+    showNotice(error.message, 'error');
+  } finally {
+    updateAutoTradeAvailability();
   }
 });
 
@@ -447,6 +604,9 @@ window.setInterval(updateSessionClock, 1000);
 window.setInterval(() => {
   if (connected && $('#scan-auto-refresh').checked) refreshScanner(false).catch(() => {});
 }, 1000);
+window.setInterval(() => {
+  if (connected) refreshConnection(false).catch(() => {});
+}, 30000);
 
 try {
   $('#scan-auto-refresh').checked = localStorage.getItem('dhan-auto-scan') !== 'false';

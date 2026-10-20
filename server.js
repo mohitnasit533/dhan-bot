@@ -9,19 +9,44 @@ const { rateLimit } = require('express-rate-limit');
 const dhan = require('./dhan');
 const { isEntryWindowOpen } = dhan;
 const { isAllowedLocalHost, isSameOriginRequest } = require('./local-security');
-const { findActiveSuperOrder, isTerminalSuperOrder, findReconciledOrder } = require('./live-order-guard');
+const {
+  findActiveSuperOrder,
+  findActiveRegularOrder,
+  isActiveRegularOrder,
+  countLiveExposure: countTrackedLiveExposure,
+  isReconciledOrderTerminal
+} = require('./live-order-guard');
 const { createAutoSignalStore } = require('./auto-signal-store');
-const { saveAccessToken } = require('./token-env-store');
+const { saveAccessToken, saveDhanCredentials } = require('./token-env-store');
+const { createLocalStateStore } = require('./local-state-store');
+const { createMarketSafety } = require('./market-safety');
+const { createAppLogger } = require('./app-logger');
+const {
+  DEFAULT_SETTINGS,
+  validateTradeSettings,
+  missingRiskSettings,
+  calculatePaperDailyPnl,
+  calculateBotLiveDailyPnl,
+  indiaDate,
+  dailyLossReached
+} = require('./risk-controls');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const HOST = '127.0.0.1';
 const AUTO_SIGNAL_STATE_PATH = path.join(__dirname, '.dhan-auto-state.json');
+const LOCAL_STATE_PATH = path.join(__dirname, '.dhan-local-state.json');
+const MARKET_SAFETY_STATE_PATH = path.join(__dirname, '.dhan-market-safety.json');
+const LOG_DIRECTORY = path.join(__dirname, '.dhan-logs');
 const ENV_FILE_PATH = path.join(__dirname, '.env');
 const TOKEN_RENEW_INTERVAL_MS = 20 * 60 * 60 * 1000;
 const TOKEN_RETRY_INTERVAL_MS = 10 * 60 * 1000;
 const MAX_ACTIVE_TRADES = 5;
 const MAX_CLOSED_TRADES = 1000;
+const localStateStore = createLocalStateStore(LOCAL_STATE_PATH, DEFAULT_SETTINGS, validateTradeSettings);
+const persistedState = localStateStore.getState();
+const marketSafety = createMarketSafety({ statePath: MARKET_SAFETY_STATE_PATH });
+const appLogger = createAppLogger(LOG_DIRECTORY);
 let tradingMode = 'PAPER';
 let tokenRenewalTimer = null;
 let tokenRenewalStatus = { enabled: false, message: 'Add Dhan credentials to .env to enable automatic token renewal.' };
@@ -73,22 +98,97 @@ const tradeMutationLimiter = rateLimit({
 app.use('/api/trade', tradeMutationLimiter);
 
 let allowedSymbols = new Set();
-const activeTrades = new Map();
-const closedTrades = [];
+const activeTrades = new Map(persistedState.activeTrades.map((trade) => [trade.symbol, trade]));
+const closedTrades = [...persistedState.closedTrades];
+const liveTrades = [...persistedState.liveTrades];
 const orderPreviews = new Map();
 const autoSignalStore = createAutoSignalStore(AUTO_SIGNAL_STATE_PATH);
 const lastAutoSignals = autoSignalStore.signals;
-const liveSubmissionLocks = new Map();
+const liveSubmissionLocks = new Map(persistedState.liveTrades
+  .filter((trade) => trade.status !== 'CLOSED')
+  .map((trade) => [trade.symbol, {
+    correlationId: trade.correlationId || null,
+    orderId: trade.orderId || null,
+    state: 'uncertain'
+  }]));
 const autoTradeConfig = {
   enabled: false,
-  settings: { lotSize: 1, maxTrades: 5, stopLossPct: 20, targetPct: 50 }
+  settings: persistedState.settings,
+  lastError: null
 };
+
+let persistenceFailure = null;
+function saveLocalState() {
+  try {
+    localStateStore.save({
+      settings: autoTradeConfig.settings,
+      activeTrades: getActiveTradesList().filter((trade) => trade.status === 'OPEN'),
+      closedTrades,
+      liveTrades
+    });
+    persistenceFailure = null;
+  } catch (error) {
+    persistenceFailure = error.message;
+    throw error;
+  }
+}
+
+function getPaperDailyPnl() {
+  return calculatePaperDailyPnl(getActiveTradesList(), closedTrades);
+}
+
+function assertRiskConfigured() {
+  const missing = missingRiskSettings(autoTradeConfig.settings);
+  if (missing.length) throw new Error(`Configure these trade controls before placing orders: ${missing.join(', ')}.`);
+}
+
+function getDailyPnl(brokerPositions) {
+  const livePositions = tradingMode === 'LIVE'
+    ? brokerPositions ?? marketSnapshot?.brokerPositions ?? []
+    : [];
+  return getPaperDailyPnl() + calculateBotLiveDailyPnl(liveTrades, livePositions);
+}
+
+let killSwitchAlertDate = null;
+function assertDailyLossLimit(brokerPositions = []) {
+  const pnl = getDailyPnl(brokerPositions);
+  if (dailyLossReached(pnl, autoTradeConfig.settings.maxDailyLossInr)) {
+    const firstAlertToday = killSwitchAlertDate !== indiaDate();
+    killSwitchAlertDate = indiaDate();
+    autoTradeConfig.enabled = false;
+    saveLocalState();
+    if (firstAlertToday) {
+      void notify('critical', 'Daily max-loss kill switch activated; new bot entries are blocked.', {
+        dailyPnlInr: Number(pnl.toFixed(2)),
+        maxDailyLossInr: autoTradeConfig.settings.maxDailyLossInr
+      });
+    }
+    throw new Error(`Daily max-loss kill switch is active: this bot is down ₹${Math.abs(pnl).toFixed(2)} today. New entries are blocked.`);
+  }
+  return pnl;
+}
+
+async function notify(level, message, details = {}) {
+  try {
+    await appLogger.alert(level, message, details);
+  } catch (error) {
+    autoTradeConfig.lastError = `Alert/logging failed: ${error.message}`;
+    console.error(autoTradeConfig.lastError);
+  }
+}
 
 const rememberAutoSignal = autoSignalStore.remember;
 
 function recordClosedTrade(trade) {
   closedTrades.push({ ...trade });
-  if (closedTrades.length > MAX_CLOSED_TRADES) closedTrades.shift();
+  const removedTrade = closedTrades.length > MAX_CLOSED_TRADES ? closedTrades.shift() : null;
+  try {
+    saveLocalState();
+  } catch (error) {
+    closedTrades.pop();
+    if (removedTrade) closedTrades.unshift(removedTrade);
+    throw error;
+  }
 }
 
 function getActiveTradesList() {
@@ -147,14 +247,21 @@ function createPaperTrade(preview) {
     currentPrice: preview.order.price,
     stopPrice: preview.order.stopLossPrice,
     targetPrice: preview.order.targetPrice,
-    stopLossPct: preview.risk.stopLossPct,
-    targetPct: preview.risk.targetPct,
+    stopLossInr: preview.risk.stopLossInr,
+    targetInr: preview.risk.targetInr,
     status: 'OPEN',
     openedAt: new Date().toISOString(),
     pnlPct: 0,
+    pnlInr: 0,
     entryType: preview.entryType || 'MANUAL'
   };
   activeTrades.set(preview.symbol, trade);
+  try {
+    saveLocalState();
+  } catch (error) {
+    activeTrades.delete(preview.symbol);
+    throw error;
+  }
   return trade;
 }
 
@@ -163,8 +270,32 @@ function positionMatchesUnderlying(position, symbol) {
   return instrumentName === symbol || instrumentName.startsWith(`${symbol}-`) || instrumentName.startsWith(`${symbol} `);
 }
 
+function syncBotLiveTrades(positions) {
+  let changed = false;
+  for (const trade of liveTrades) {
+    if (indiaDate(new Date(trade.openedAt)) !== indiaDate()) continue;
+    const position = positions.find((item) => String(item.securityId) === String(trade.securityId));
+    if (!position) continue;
+    const realized = Number(position.realizedProfit ?? position.realisedProfit ?? 0);
+    const unrealized = Number(position.unrealizedProfit ?? position.unrealisedProfit ?? 0);
+    if (!Number.isFinite(realized) || !Number.isFinite(unrealized)) continue;
+    const pnl = realized + unrealized;
+    if (trade.lastPnlInr !== pnl) {
+      trade.lastPnlInr = pnl;
+      changed = true;
+    }
+    if (Number(position.netQty) === 0 && trade.status !== 'CLOSED') {
+      trade.status = 'CLOSED';
+      trade.closedAt = new Date().toISOString();
+      changed = true;
+    }
+  }
+  if (changed) saveLocalState();
+}
+
 function syncPaperTrades(optionQuotes) {
   for (const trade of getActiveTradesList()) {
+    const previousTrade = { ...trade };
     const currentPrice = Number(optionQuotes[trade.securityId]?.last_price);
     if (!Number.isFinite(currentPrice) || currentPrice <= 0) continue;
 
@@ -173,6 +304,7 @@ function syncPaperTrades(optionQuotes) {
     const pnlPct = ((trade.entryPrice - currentPrice) / trade.entryPrice) * 100;
 
     trade.pnlPct = pnlPct;
+    trade.pnlInr = (trade.entryPrice - currentPrice) * trade.quantity;
 
     const shouldClose = currentPrice >= trade.stopPrice || currentPrice <= trade.targetPrice;
     if (shouldClose) {
@@ -180,8 +312,18 @@ function syncPaperTrades(optionQuotes) {
       trade.exitReason = currentPrice >= trade.stopPrice ? 'STOP_LOSS' : 'TARGET';
       trade.exitPrice = currentPrice;
       trade.closedAt = new Date().toISOString();
-      recordClosedTrade(trade);
-      activeTrades.delete(trade.symbol);
+      try {
+        recordClosedTrade(trade);
+        activeTrades.delete(trade.symbol);
+      } catch (error) {
+        Object.assign(trade, previousTrade);
+        throw error;
+      }
+      void notify('info', 'Paper position closed by its configured risk exit.', {
+        symbol: trade.symbol,
+        exitReason: trade.exitReason,
+        pnlInr: Number(trade.pnlInr.toFixed(2))
+      });
     }
   }
 }
@@ -190,6 +332,7 @@ async function runPaperAutoTrades(results) {
   if (!isEntryWindowOpen()) return;
 
   for (const result of results) {
+    if (!autoTradeConfig.enabled) return;
     if (result.signal !== 'BUY' && result.signal !== 'SELL') {
       continue;
     }
@@ -204,61 +347,73 @@ async function runPaperAutoTrades(results) {
     if (activeTrades.size >= autoTradeConfig.settings.maxTrades) continue;
 
     try {
+      assertRiskConfigured();
+      assertDailyLossLimit();
+      await marketSafety.assertCanTrade(result.symbol);
       const orderPreview = await dhan.createOptionOrderPreview({
         symbol: result.symbol,
         signal: result.signal,
         lots: autoTradeConfig.settings.lotSize,
-        includeMargin: false
+        includeMargin: false,
+        riskSettings: autoTradeConfig.settings
       });
+      if (!autoTradeConfig.enabled || tradingMode !== 'PAPER' || !dhan.getConnection()) return;
+      const latestScan = await dhan.getLiveScan(getActiveTradesList().map((trade) => trade.securityId));
+      const latest = latestScan.results.find((row) => row.symbol === result.symbol);
+      if (!autoTradeConfig.enabled || tradingMode !== 'PAPER' || !dhan.getConnection()) return;
+      if (latest?.signal !== result.signal || latest?.lastCandleAt !== result.lastCandleAt || latest?.dataState !== 'READY') continue;
+      syncPaperTrades(latestScan.optionQuotes);
+      assertDailyLossLimit();
+      if (activeTrades.has(result.symbol) || activeTrades.size >= autoTradeConfig.settings.maxTrades) continue;
       if (!rememberAutoSignal(result.symbol, signalKey)) continue;
       createPaperTrade({ ...orderPreview, symbol: result.symbol, lots: autoTradeConfig.settings.lotSize, entryType: 'AUTO' });
+      void notify('info', 'Paper position opened by a confirmed signal.', {
+        symbol: result.symbol,
+        signal: result.signal,
+        lots: autoTradeConfig.settings.lotSize
+      });
       autoTradeConfig.lastError = null;
     } catch (error) {
       autoTradeConfig.lastError = `${result.symbol}: ${error.message}`;
+      if (error.message.includes('Daily max-loss')) return;
     }
   }
 }
 
-function countLiveExposure(positions, superOrders) {
-  const openPositions = positions.filter((position) => Number(position.netQty) !== 0);
-  const reservations = new Set();
-  for (const order of superOrders) {
-    if (!['TRANSIT', 'PENDING', 'PART_TRADED', 'TRADED'].includes(String(order.orderStatus).toUpperCase())) continue;
-    const name = String(order.tradingSymbol || order.securityName || '').toUpperCase();
-    const symbol = Array.from(allowedSymbols).find((candidate) => name === candidate || name.startsWith(`${candidate}-`) || name.startsWith(`${candidate} `));
-    const reservation = symbol || `order:${order.orderId || order.correlationId}`;
-    if (!openPositions.some((position) => symbol && positionMatchesUnderlying(position, symbol))) reservations.add(reservation);
-  }
-  for (const symbol of liveSubmissionLocks.keys()) {
-    if (!openPositions.some((position) => positionMatchesUnderlying(position, symbol))) reservations.add(symbol);
-  }
-  return openPositions.length + reservations.size;
+function countLiveExposure(positions, superOrders, regularOrders = []) {
+  return countTrackedLiveExposure(positions, superOrders, regularOrders, liveSubmissionLocks, allowedSymbols);
 }
 
-async function runLiveAutoTrades(results, positions, superOrders) {
+async function runLiveAutoTrades(results, positions, superOrders, regularOrders) {
   if (!autoTradeConfig.enabled || tradingMode !== 'LIVE' || !dhan.getConnection() || !isEntryWindowOpen()) return;
 
   for (const result of results) {
+    if (!autoTradeConfig.enabled || tradingMode !== 'LIVE' || !dhan.getConnection()) return;
     if (result.dataState !== 'READY' || !['BUY', 'SELL'].includes(result.signal)) continue;
     const signalKey = `${result.lastCandleAt || 'unknown'}:${result.signal}`;
     if (lastAutoSignals.get(result.symbol) === signalKey) continue;
     if (positions.some((position) => positionMatchesUnderlying(position, result.symbol))
       || findActiveSuperOrder(superOrders, result.symbol)
+      || findActiveRegularOrder(regularOrders, result.symbol)
       || liveSubmissionLocks.has(result.symbol)) {
       try { rememberAutoSignal(result.symbol, signalKey); } catch (error) {
         autoTradeConfig.lastError = `Could not save auto-trade duplicate protection: ${error.message}`;
       }
       continue;
     }
-    if (countLiveExposure(positions, superOrders) >= autoTradeConfig.settings.maxTrades) continue;
+    if (countLiveExposure(positions, superOrders, regularOrders) >= autoTradeConfig.settings.maxTrades) continue;
     const reservation = { correlationId: null, state: 'preparing' };
     liveSubmissionLocks.set(result.symbol, reservation);
     let orderSubmissionAttempted = false;
     try {
+      assertRiskConfigured();
+      assertDailyLossLimit(positions);
+      await marketSafety.assertCanTrade(result.symbol);
       const preview = await dhan.createOptionOrderPreview({
         symbol: result.symbol,
         signal: result.signal,
-        lots: autoTradeConfig.settings.lotSize
+        lots: autoTradeConfig.settings.lotSize,
+        riskSettings: autoTradeConfig.settings
       });
       const orderNotional = Number(preview.preview['Order notional']);
       if (orderNotional > 50000) {
@@ -278,17 +433,29 @@ async function runLiveAutoTrades(results, positions, superOrders) {
         continue;
       }
 
-      const [currentPositions, currentOrders] = await Promise.all([dhan.getPositions(), dhan.getSuperOrders()]);
+      const [currentPositions, currentOrders, currentRegularOrders] = await Promise.all([
+        dhan.getPositions(),
+        dhan.getSuperOrders(),
+        dhan.getOrders()
+      ]);
       const currentOpenPositions = currentPositions.filter((position) => Number(position.netQty) !== 0);
       if (currentOpenPositions.some((position) => positionMatchesUnderlying(position, result.symbol))
-        || findActiveSuperOrder(currentOrders, result.symbol)) {
+        || findActiveSuperOrder(currentOrders, result.symbol)
+        || findActiveRegularOrder(currentRegularOrders, result.symbol)) {
         liveSubmissionLocks.delete(result.symbol);
         continue;
       }
-      if (countLiveExposure(currentPositions, currentOrders) > autoTradeConfig.settings.maxTrades) {
+      if (countLiveExposure(currentPositions, currentOrders, currentRegularOrders) > autoTradeConfig.settings.maxTrades) {
         liveSubmissionLocks.delete(result.symbol);
         continue;
       }
+      if (!autoTradeConfig.enabled || tradingMode !== 'LIVE' || !dhan.getConnection() || !isEntryWindowOpen()) {
+        liveSubmissionLocks.delete(result.symbol);
+        continue;
+      }
+      assertDailyLossLimit(currentPositions);
+      await marketSafety.assertCanTrade(result.symbol);
+      const margin = await dhan.checkOrderMargin(preview.order);
       if (!autoTradeConfig.enabled || tradingMode !== 'LIVE' || !dhan.getConnection() || !isEntryWindowOpen()) {
         liveSubmissionLocks.delete(result.symbol);
         continue;
@@ -299,12 +466,38 @@ async function runLiveAutoTrades(results, positions, superOrders) {
         continue;
       }
       reservation.correlationId = preview.order.correlationId;
+      const liveTrade = {
+        symbol: result.symbol,
+        securityId: preview.order.securityId,
+        entryPrice: preview.order.price,
+        quantity: preview.order.quantity,
+        openedAt: new Date().toISOString(),
+        status: 'SUBMITTING',
+        lastPnlInr: 0,
+        correlationId: preview.order.correlationId
+      };
+      liveTrades.push(liveTrade);
+      try {
+        saveLocalState();
+      } catch (error) {
+        liveTrades.pop();
+        throw error;
+      }
       reservation.state = 'submitting';
       orderSubmissionAttempted = true;
       const response = await dhan.placeSuperOrder(preview.order);
       const orderData = response.data || response;
       reservation.orderId = orderData.orderId || orderData.order_id || null;
       reservation.state = 'submitted';
+      liveTrade.status = 'SUBMITTED';
+      liveTrade.orderId = reservation.orderId;
+      saveLocalState();
+      void notify('warning', 'Confirmed signal submitted as a live Dhan order.', {
+        symbol: result.symbol,
+        orderId: reservation.orderId || 'pending',
+        estimatedMargin: margin.totalMargin,
+        availableFunds: margin.availableFunds
+      });
       autoTradeConfig.lastError = null;
     } catch (error) {
       if (orderSubmissionAttempted) reservation.state = 'uncertain';
@@ -316,8 +509,8 @@ async function runLiveAutoTrades(results, positions, superOrders) {
 
 let latestLiveAutoSnapshot = null;
 let liveAutoQueueRunning = false;
-function scheduleLiveAutoTrades(results, positions, superOrders) {
-  latestLiveAutoSnapshot = { results, positions, superOrders };
+function scheduleLiveAutoTrades(results, positions, superOrders, regularOrders) {
+  latestLiveAutoSnapshot = { results, positions, superOrders, regularOrders };
   if (liveAutoQueueRunning) return;
   liveAutoQueueRunning = true;
   setImmediate(async () => {
@@ -325,7 +518,7 @@ function scheduleLiveAutoTrades(results, positions, superOrders) {
       while (latestLiveAutoSnapshot) {
         const snapshot = latestLiveAutoSnapshot;
         latestLiveAutoSnapshot = null;
-        await runLiveAutoTrades(snapshot.results, snapshot.positions, snapshot.superOrders);
+        await runLiveAutoTrades(snapshot.results, snapshot.positions, snapshot.superOrders, snapshot.regularOrders);
       }
     } catch (error) {
       autoTradeConfig.lastError = error.message;
@@ -334,7 +527,8 @@ function scheduleLiveAutoTrades(results, positions, superOrders) {
       if (latestLiveAutoSnapshot) scheduleLiveAutoTrades(
         latestLiveAutoSnapshot.results,
         latestLiveAutoSnapshot.positions,
-        latestLiveAutoSnapshot.superOrders
+        latestLiveAutoSnapshot.superOrders,
+        latestLiveAutoSnapshot.regularOrders
       );
     }
   });
@@ -350,16 +544,22 @@ async function updateMarketSnapshot() {
     allowedSymbols = new Set(scan.results.map((row) => row.symbol));
     if (tradingMode === 'PAPER') {
       syncPaperTrades(scan.optionQuotes);
+      checkDailyLossAfterSnapshot([]);
       if (autoTradeConfig.enabled) await runPaperAutoTrades(scan.results);
       marketSnapshot = { scan, brokerPositions: [], activePositions: getActiveTradesList() };
     } else {
-      const [positions, superOrders] = await Promise.all([dhan.getPositions(), dhan.getSuperOrders()]);
+      const [positions, superOrders, regularOrders] = await Promise.all([
+        dhan.getPositions(),
+        dhan.getSuperOrders(),
+        dhan.getOrders()
+      ]);
+      syncBotLiveTrades(positions);
       const brokerPositions = positions.filter((position) => Number(position.netQty) !== 0);
+      checkDailyLossAfterSnapshot(positions);
       for (const [symbol, reservation] of liveSubmissionLocks) {
-        const order = findReconciledOrder(superOrders, reservation);
-        if (order && isTerminalSuperOrder(order)) liveSubmissionLocks.delete(symbol);
+        if (isReconciledOrderTerminal(superOrders, regularOrders, reservation)) liveSubmissionLocks.delete(symbol);
       }
-      if (autoTradeConfig.enabled) scheduleLiveAutoTrades(scan.results, brokerPositions, superOrders);
+      if (autoTradeConfig.enabled) scheduleLiveAutoTrades(scan.results, positions, superOrders, regularOrders);
       marketSnapshot = { scan, brokerPositions, activePositions: [] };
     }
     return marketSnapshot;
@@ -372,19 +572,61 @@ async function updateMarketSnapshot() {
   }
 }
 
+function checkDailyLossAfterSnapshot(positions) {
+  try {
+    assertDailyLossLimit(positions);
+  } catch (error) {
+    if (!error.message.startsWith('Daily max-loss kill switch is active:')) throw error;
+    autoTradeConfig.lastError = error.message;
+  }
+}
+
 app.get('/api/health', (req, res) => {
   res.json({ ok: true, service: 'dhan-local-dashboard', timestamp: new Date().toISOString() });
 });
 
-app.get('/api/connection', (req, res) => {
+function suspendAutoTrade(reason) {
+  if (!autoTradeConfig.enabled) return;
+  autoTradeConfig.enabled = false;
+  autoTradeConfig.lastError = reason;
+  try {
+    saveLocalState();
+  } catch (error) {
+    autoTradeConfig.lastError += ` Local state save failed: ${error.message}`;
+  }
+  void notify('critical', `Automatic trading was stopped: ${autoTradeConfig.lastError}`);
+}
+
+app.get('/api/connection', async (req, res) => {
+  let profile = null;
+  let verificationError = null;
+  if (dhan.getConnection()) {
+    try {
+      profile = await dhan.verifyConnection();
+    } catch (error) {
+      verificationError = error.message;
+      suspendAutoTrade(`Dhan profile verification failed: ${error.message}`);
+    }
+  }
+  const dailyPnlInr = getDailyPnl(marketSnapshot?.brokerPositions || []);
   res.json({
     ok: true,
-    connected: Boolean(dhan.getConnection()),
-    profile: dhan.getConnection(),
+    connected: Boolean(profile),
+    profile,
+    verification: {
+      verified: Boolean(profile),
+      checkedAt: dhan.getConnectionVerification().verifiedAt,
+      error: verificationError
+    },
     mode: tradingMode,
     tokenRenewal: tokenRenewalStatus,
     autoTrade: autoTradeConfig.enabled,
-    settings: autoTradeConfig.settings
+    settings: autoTradeConfig.settings,
+    riskReady: missingRiskSettings(autoTradeConfig.settings).length === 0,
+    missingRiskSettings: missingRiskSettings(autoTradeConfig.settings),
+    dailyPnlInr,
+    marketSafety: marketSafety.getStatus(),
+    persistenceError: persistenceFailure
   });
 });
 
@@ -397,11 +639,30 @@ app.post('/api/connect', rateLimit({
 }), async (req, res) => {
   try {
     const profile = await dhan.connect(req.body?.clientId, req.body?.accessToken);
-    if (process.env.DHAN_CLIENT_ID?.trim() === String(req.body?.clientId || '').trim()
-      && process.env.DHAN_ACCESS_TOKEN?.trim() === String(req.body?.accessToken || '').trim()) {
-      tokenRenewalStatus = { enabled: true, message: 'Dhan token connected. Automatic renewal is starting.' };
-      renewConfiguredToken();
+  let persistenceMessage = '';
+  if (req.body?.rememberCredentials === true) {
+    try {
+      const clientId = String(req.body.clientId).trim();
+      const accessToken = String(req.body.accessToken).trim();
+      saveDhanCredentials(ENV_FILE_PATH, clientId, accessToken);
+      process.env.DHAN_CLIENT_ID = clientId;
+      process.env.DHAN_ACCESS_TOKEN = accessToken;
+    } catch (error) {
+      tokenRenewalStatus = { enabled: false, message: 'Verified credentials remain in memory only; local .env save failed.' };
+      persistenceMessage = ` Credentials were verified but could not be saved locally: ${error.message}`;
     }
+  }
+  if (!persistenceMessage
+    && process.env.DHAN_CLIENT_ID?.trim() === String(req.body?.clientId || '').trim()
+    && process.env.DHAN_ACCESS_TOKEN?.trim() === String(req.body?.accessToken || '').trim()) {
+    tokenRenewalStatus = { enabled: true, message: 'Dhan token connected. Automatic renewal is starting.' };
+    renewConfiguredToken();
+  } else if (!persistenceMessage) {
+    tokenRenewalStatus = {
+      enabled: false,
+      message: 'Credentials are held in server memory only; select local saving to enable automatic renewal.'
+    };
+  }
     res.json({
       ok: true,
       connected: true,
@@ -411,8 +672,8 @@ app.post('/api/connect', rateLimit({
       autoTrade: autoTradeConfig.enabled,
       settings: autoTradeConfig.settings,
       message: tokenRenewalStatus.enabled
-        ? `Connected to Dhan as ${profile.name}. Automatic token renewal is enabled.`
-        : `Connected to Dhan as ${profile.name}. Credentials are held in server memory only.`
+        ? `Connected to Dhan as ${profile.name}. Automatic token renewal is enabled.${persistenceMessage}`
+        : `Connected to Dhan as ${profile.name}. ${persistenceMessage || 'Credentials are held in server memory only.'}`
     });
   } catch (error) {
     res.status(error.statusCode || 400).json({ ok: false, connected: false, message: error.message });
@@ -420,6 +681,9 @@ app.post('/api/connect', rateLimit({
 });
 
 app.post('/api/disconnect', (req, res) => {
+  if (Array.from(liveSubmissionLocks.values()).some((reservation) => reservation.state === 'submitting')) {
+    return res.status(409).json({ ok: false, message: 'A live order submission is in progress. Wait for its broker response before disconnecting.' });
+  }
   if (tokenRenewalTimer) clearTimeout(tokenRenewalTimer);
   tokenRenewalTimer = null;
   tokenRenewalStatus = { enabled: false, message: 'Dhan account disconnected.' };
@@ -433,13 +697,24 @@ app.post('/api/disconnect', (req, res) => {
   res.json({ ok: true, connected: false, mode: tradingMode, message: 'Dhan disconnected. Trading mode returned to Paper.' });
 });
 
-app.post('/api/mode', (req, res) => {
+app.post('/api/mode', async (req, res) => {
   const mode = req.body?.mode;
   if (mode !== 'PAPER' && mode !== 'LIVE') {
     return res.status(400).json({ ok: false, message: 'Mode must be PAPER or LIVE.' });
   }
   if (mode === 'LIVE' && !dhan.getConnection()) {
     return res.status(409).json({ ok: false, message: 'Connect and verify your Dhan account before enabling Live mode.' });
+  }
+  if (mode === 'LIVE') {
+    try {
+      await dhan.verifyConnection();
+    } catch (error) {
+      return res.status(401).json({ ok: false, message: `Dhan profile verification failed: ${error.message}` });
+    }
+  }
+  if (mode !== tradingMode
+    && Array.from(liveSubmissionLocks.values()).some((reservation) => reservation.state === 'submitting')) {
+    return res.status(409).json({ ok: false, message: 'A live order submission is in progress. Wait for its broker response before changing modes.' });
   }
 
   if (tradingMode !== mode) orderPreviews.clear();
@@ -481,6 +756,12 @@ app.get('/api/scanner', async (req, res) => {
       activePositions: snapshot.activePositions,
       brokerPositions: snapshot.brokerPositions,
       closedPositions: closedTrades,
+      runningPnlInr: tradingMode === 'PAPER'
+        ? getActiveTradesList().reduce((total, trade) => total + Number(trade.pnlInr || 0), 0)
+        : snapshot.brokerPositions.reduce((total, position) => total + Number(position.unrealizedProfit ?? position.unrealisedProfit ?? 0), 0),
+      marketSafety: marketSafety.getStatus(),
+      riskReady: missingRiskSettings(autoTradeConfig.settings).length === 0,
+      missingRiskSettings: missingRiskSettings(autoTradeConfig.settings),
       autoTrade: {
         enabled: autoTradeConfig.enabled,
         mode: tradingMode,
@@ -497,6 +778,7 @@ app.post('/api/trade/preview', async (req, res) => {
   if (!dhan.getConnection()) return res.status(401).json({ ok: false, message: 'Connect Dhan before creating an order preview.' });
   if (!isEntryWindowOpen()) return res.status(409).json({ ok: false, message: 'New entries are allowed only on weekdays from 09:45 to before 14:00 IST.' });
 
+  const requestedMode = tradingMode;
   const { symbol, signal } = req.body || {};
   const lots = Number(req.body?.lots);
   if (typeof symbol !== 'string' || !allowedSymbols.has(symbol) || !['BUY', 'SELL'].includes(signal)) {
@@ -510,28 +792,52 @@ app.post('/api/trade/preview', async (req, res) => {
   }
 
   try {
+    assertRiskConfigured();
+    if (tradingMode === 'LIVE') assertDailyLossLimit(await dhan.getPositions());
+    await marketSafety.assertCanTrade(symbol);
     const scan = await dhan.getLiveScan(getActiveTradesList().map((trade) => trade.securityId));
+    if (tradingMode !== requestedMode || !dhan.getConnection()) {
+      return res.status(409).json({ ok: false, message: 'Connection or trading mode changed while preparing this preview. Try again.' });
+    }
+    if (tradingMode === 'PAPER') {
+      syncPaperTrades(scan.optionQuotes);
+      assertDailyLossLimit();
+    }
     const signalRow = scan.results.find((item) => item.symbol === symbol);
     if (!signalRow || signalRow.signal !== signal) {
       return res.status(409).json({ ok: false, message: 'The confirmed 15-minute signal has changed. Refresh the scanner before previewing.' });
     }
 
     if (tradingMode === 'LIVE') {
-      const positions = await dhan.getPositions();
+      const [positions, superOrders, regularOrders] = await Promise.all([
+        dhan.getPositions(),
+        dhan.getSuperOrders(),
+        dhan.getOrders()
+      ]);
       const openPositions = positions.filter((position) => Number(position.netQty) !== 0);
-      if (openPositions.some((position) => positionMatchesUnderlying(position, symbol))) {
-        return res.status(409).json({ ok: false, message: `${symbol} already has an open Dhan position.` });
+      if (liveSubmissionLocks.has(symbol)) {
+        return res.status(409).json({ ok: false, message: `${symbol} already has a live order being reconciled. Check Dhan before trying again.` });
       }
-      if (openPositions.length >= MAX_ACTIVE_TRADES) {
-        return res.status(409).json({ ok: false, message: `The maximum of ${MAX_ACTIVE_TRADES} live positions has been reached.` });
+      if (openPositions.some((position) => positionMatchesUnderlying(position, symbol))
+        || findActiveSuperOrder(superOrders, symbol)
+        || findActiveRegularOrder(regularOrders, symbol)) {
+        return res.status(409).json({ ok: false, message: `${symbol} already has an open Dhan position or pending order.` });
+      }
+      if (countLiveExposure(positions, superOrders, regularOrders) >= autoTradeConfig.settings.maxTrades) {
+        return res.status(409).json({ ok: false, message: `The configured maximum of ${autoTradeConfig.settings.maxTrades} live positions has been reached.` });
       }
     }
 
     const orderPreview = await dhan.createOptionOrderPreview({
       symbol,
       signal,
-      lots
+      lots,
+      includeMargin: tradingMode === 'LIVE',
+      riskSettings: autoTradeConfig.settings
     });
+    if (tradingMode !== requestedMode || !dhan.getConnection()) {
+      return res.status(409).json({ ok: false, message: 'Connection or trading mode changed while preparing this preview. Try again.' });
+    }
 
     const previewId = randomUUID();
     for (const [id, pending] of orderPreviews) {
@@ -539,12 +845,12 @@ app.post('/api/trade/preview', async (req, res) => {
     }
     if (orderPreviews.size >= 20) return res.status(429).json({ ok: false, message: 'Too many pending previews. Confirm or wait for one to expire.' });
 
-    orderPreviews.set(previewId, { ...orderPreview, mode: tradingMode, symbol, signal, lots, expiresAt: Date.now() + 120000 });
+    orderPreviews.set(previewId, { ...orderPreview, mode: requestedMode, symbol, signal, lots, expiresAt: Date.now() + 120000 });
     const orderNotional = Number(orderPreview.preview['Order notional']);
     const warning = orderNotional > 50000
       ? `Warning: estimated notional ₹${orderNotional.toLocaleString('en-IN')} exceeds ₹50,000. ${orderPreview.warning}`
       : orderPreview.warning;
-    res.json({ ok: true, previewId, mode: tradingMode, preview: orderPreview.preview, warning });
+    res.json({ ok: true, previewId, mode: requestedMode, preview: orderPreview.preview, warning });
   } catch (error) {
     res.status(error.statusCode || 502).json({ ok: false, message: error.message });
   }
@@ -562,15 +868,23 @@ app.post('/api/trade/execute', async (req, res) => {
     return res.status(409).json({ ok: false, message: 'New entries are allowed only on weekdays from 09:45 to before 14:00 IST.' });
   }
 
+  try {
+    assertRiskConfigured();
+    await marketSafety.assertCanTrade(preview.symbol);
+  } catch (error) {
+    return res.status(409).json({ ok: false, message: error.message });
+  }
+
   const liveSymbol = preview.underlying;
   if (tradingMode === 'LIVE') {
     const held = liveSubmissionLocks.get(liveSymbol);
     if (held) {
       try {
-        const orders = await dhan.getSuperOrders();
+        const [superOrders, regularOrders] = await Promise.all([dhan.getSuperOrders(), dhan.getOrders()]);
         for (const [reservedSymbol, reservation] of liveSubmissionLocks) {
-          const matched = findReconciledOrder(orders, reservation);
-          if (matched && isTerminalSuperOrder(matched)) liveSubmissionLocks.delete(reservedSymbol);
+          if (isReconciledOrderTerminal(superOrders, regularOrders, reservation)) {
+            liveSubmissionLocks.delete(reservedSymbol);
+          }
         }
         if (liveSubmissionLocks.has(liveSymbol)) {
           return res.status(409).json({ ok: false, message: `${liveSymbol} already has a live order being reconciled. Check Dhan order status before trying again.` });
@@ -584,8 +898,10 @@ app.post('/api/trade/execute', async (req, res) => {
 
   try {
     const latestScan = await dhan.getLiveScan();
-    const currentSignal = latestScan.results.find((item) => item.symbol === preview.symbol)?.signal;
-    if (currentSignal !== preview.signal) {
+    const currentRow = latestScan.results.find((item) => item.symbol === preview.symbol);
+    if (tradingMode === 'PAPER') syncPaperTrades(latestScan.optionQuotes);
+    assertDailyLossLimit(tradingMode === 'LIVE' ? await dhan.getPositions() : []);
+    if (currentRow?.signal !== preview.signal || currentRow.dataState !== 'READY') {
       if (tradingMode === 'LIVE') liveSubmissionLocks.delete(liveSymbol);
       return res.status(409).json({ ok: false, message: 'The confirmed 15-minute signal changed after preview. Refresh the scanner and create a fresh preview.' });
     }
@@ -605,6 +921,11 @@ app.post('/api/trade/execute', async (req, res) => {
     }
 
     const trade = createPaperTrade({ ...preview, lots: preview.lots });
+    void notify('info', 'Paper position opened after manual confirmation.', {
+      symbol: preview.symbol,
+      signal: preview.signal,
+      lots: preview.lots
+    });
     return res.json({ ok: true, status: 'paper_filled', trade, message: `${preview.symbol} paper option order recorded at ${preview.order.price}.` });
   }
 
@@ -618,9 +939,15 @@ app.post('/api/trade/execute', async (req, res) => {
       liveSubmissionLocks.delete(liveSymbol);
       return res.status(409).json({ ok: false, message: 'Trading mode changed. Create a fresh preview.' });
     }
-    const [positions, superOrders] = await Promise.all([dhan.getPositions(), dhan.getSuperOrders()]);
+    const [positions, superOrders, regularOrders] = await Promise.all([
+      dhan.getPositions(),
+      dhan.getSuperOrders(),
+      dhan.getOrders()
+    ]);
+    assertDailyLossLimit(positions);
     const openPositions = positions.filter((position) => Number(position.netQty) !== 0);
-    const pendingUnderlyingOrder = findActiveSuperOrder(superOrders, preview.underlying);
+    const pendingUnderlyingOrder = findActiveSuperOrder(superOrders, preview.underlying)
+      || findActiveRegularOrder(regularOrders, preview.underlying);
     if (openPositions.some((position) => positionMatchesUnderlying(position, preview.underlying)) || pendingUnderlyingOrder) {
       liveSubmissionLocks.delete(liveSymbol);
       return res.status(409).json({ ok: false, message: `${preview.underlying} already has an open position or active order at Dhan.` });
@@ -635,10 +962,53 @@ app.post('/api/trade/execute', async (req, res) => {
         addReservation(Array.from(allowedSymbols).find((symbol) => name === symbol || name.startsWith(`${symbol}-`) || name.startsWith(`${symbol} `)) || `order:${order.orderId || order.correlationId}`);
       }
     }
+    for (const order of regularOrders.filter(isActiveRegularOrder)) {
+      const name = String(order.tradingSymbol || order.securityName || '').toUpperCase();
+      addReservation(Array.from(allowedSymbols).find((symbol) => name === symbol || name.startsWith(`${symbol}-`) || name.startsWith(`${symbol} `)) || `regular-order:${order.orderId || order.correlationId || order.securityId}`);
+    }
     for (const symbol of liveSubmissionLocks.keys()) addReservation(symbol);
     if (openPositions.length + reservedSymbols.size > MAX_ACTIVE_TRADES) {
       liveSubmissionLocks.delete(liveSymbol);
       return res.status(409).json({ ok: false, message: `The maximum of ${MAX_ACTIVE_TRADES} live positions has been reached.` });
+    }
+    const margin = await dhan.checkOrderMargin(preview.order);
+    const [finalPositions, finalOrders, finalRegularOrders] = await Promise.all([
+      dhan.getPositions(),
+      dhan.getSuperOrders(),
+      dhan.getOrders()
+    ]);
+    if (finalPositions.some((position) => positionMatchesUnderlying(position, preview.underlying))
+      || findActiveSuperOrder(finalOrders, preview.underlying)
+      || findActiveRegularOrder(finalRegularOrders, preview.underlying)) {
+      liveSubmissionLocks.delete(liveSymbol);
+      return res.status(409).json({ ok: false, message: `${preview.underlying} acquired a live position or active order during final checks.` });
+    }
+    if (countLiveExposure(finalPositions, finalOrders, finalRegularOrders) > autoTradeConfig.settings.maxTrades) {
+      liveSubmissionLocks.delete(liveSymbol);
+      return res.status(409).json({ ok: false, message: `The configured maximum of ${autoTradeConfig.settings.maxTrades} live positions has been reached.` });
+    }
+    assertDailyLossLimit(finalPositions);
+    await marketSafety.assertCanTrade(preview.symbol);
+    if (!dhan.getConnection() || tradingMode !== preview.mode || !isEntryWindowOpen()) {
+      liveSubmissionLocks.delete(liveSymbol);
+      return res.status(409).json({ ok: false, message: 'Connection, mode, or entry window changed during broker checks. Create a fresh preview.' });
+    }
+    const liveTrade = {
+      symbol: preview.symbol,
+      securityId: preview.order.securityId,
+      entryPrice: preview.order.price,
+      quantity: preview.order.quantity,
+      openedAt: new Date().toISOString(),
+      status: 'SUBMITTING',
+      lastPnlInr: 0,
+      correlationId: preview.order.correlationId
+    };
+    liveTrades.push(liveTrade);
+    try {
+      saveLocalState();
+    } catch (error) {
+      liveTrades.pop();
+      throw error;
     }
     liveSubmissionLocks.set(liveSymbol, { correlationId: preview.order.correlationId, state: 'submitting' });
     orderSubmissionAttempted = true;
@@ -649,12 +1019,28 @@ app.post('/api/trade/execute', async (req, res) => {
       orderId: orderData.orderId || orderData.order_id || null,
       state: 'submitted'
     });
+    liveTrade.status = 'SUBMITTED';
+    liveTrade.orderId = orderData.orderId || orderData.order_id || null;
+    let trackingWarning = '';
+    try {
+      saveLocalState();
+    } catch (error) {
+      autoTradeConfig.enabled = false;
+      trackingWarning = ` Local trade tracking could not be saved (${error.message}); automatic entries are disabled. Check Dhan's order book.`;
+      console.error(`Live order accepted but local tracking could not be saved: ${error.message}`);
+    }
+    void notify('warning', 'Manually confirmed live order submitted to Dhan.', {
+      symbol: preview.symbol,
+      orderId: liveTrade.orderId || 'pending',
+      estimatedMargin: margin.totalMargin,
+      availableFunds: margin.availableFunds
+    });
     res.json({
       ok: true,
       status: 'submitted',
       orderId: orderData.orderId || orderData.order_id || null,
       orderStatus: orderData.orderStatus || orderData.order_status || 'PENDING',
-      message: `Dhan accepted the live ${preview.preview.Action} order request. Check broker order status before assuming a fill.`
+      message: `Dhan accepted the live ${preview.preview.Action} order request. Check broker order status before assuming a fill.${trackingWarning}`
     });
   } catch (error) {
     const held = liveSubmissionLocks.get(liveSymbol);
@@ -679,6 +1065,7 @@ app.post('/api/trade/close', (req, res) => {
     return res.status(404).json({ ok: false, message: `${symbol} has no active position to close.` });
   }
 
+  const previousTrade = { ...current };
   const closeValue = current.currentPrice || current.entryPrice;
   current.status = 'CLOSED';
   current.exitReason = 'MANUAL';
@@ -686,42 +1073,65 @@ app.post('/api/trade/close', (req, res) => {
   current.closedAt = new Date().toISOString();
   current.pnlPct = ((current.entryPrice - closeValue) / current.entryPrice) * 100;
 
-  recordClosedTrade(current);
+  try {
+    recordClosedTrade(current);
+  } catch (error) {
+    Object.assign(current, previousTrade);
+    return res.status(500).json({ ok: false, message: `Could not persist the closed paper trade: ${error.message}` });
+  }
   activeTrades.delete(symbol);
 
   res.json({ ok: true, status: 'closed', trade: current, message: `${symbol} closed and counted as a closed position.` });
 });
 
-app.post('/api/auto-trade', (req, res) => {
+app.post('/api/auto-trade', async (req, res) => {
   const { enabled } = req.body || {};
-  const settings = {
-    lotSize: Number(req.body?.lotSize ?? autoTradeConfig.settings.lotSize),
-    maxTrades: Number(req.body?.maxTrades ?? autoTradeConfig.settings.maxTrades),
-    stopLossPct: 20,
-    targetPct: 50
-  };
-
   if (typeof enabled !== 'boolean') {
     return res.status(400).json({ ok: false, message: 'Choose Manual or Auto mode.' });
-  }
-  if (settings.lotSize < 1 || settings.lotSize > 1000 || !Number.isInteger(settings.lotSize)
-    || settings.maxTrades < 1 || settings.maxTrades > MAX_ACTIVE_TRADES || !Number.isInteger(settings.maxTrades)) {
-    return res.status(400).json({ ok: false, message: 'Lot size must be 1-1000 and maximum positions must be 1-5.' });
   }
   if (enabled && !dhan.getConnection()) {
     return res.status(401).json({ ok: false, message: 'Connect Dhan before enabling automatic signal handling.' });
   }
+  if (enabled) {
+    try {
+      await dhan.verifyConnection();
+    } catch (error) {
+      return res.status(401).json({ ok: false, message: `Dhan profile verification failed: ${error.message}` });
+    }
+  }
+  let settings;
+  try {
+    settings = validateTradeSettings(req.body || {}, autoTradeConfig.settings);
+    if (enabled) {
+      const missing = missingRiskSettings(settings);
+      if (missing.length) throw new Error(`Configure these trade controls before enabling Auto trade: ${missing.join(', ')}.`);
+    }
+  } catch (error) {
+    return res.status(400).json({ ok: false, message: error.message });
+  }
 
+  const previous = { settings: autoTradeConfig.settings, enabled: autoTradeConfig.enabled };
+  const liveSubmissionInProgress = Array.from(liveSubmissionLocks.values())
+    .some((reservation) => reservation.state === 'submitting');
   autoTradeConfig.settings = settings;
   autoTradeConfig.enabled = enabled;
   autoTradeConfig.lastError = null;
+  try {
+    saveLocalState();
+  } catch (error) {
+    autoTradeConfig.settings = previous.settings;
+    autoTradeConfig.enabled = previous.enabled;
+    return res.status(500).json({ ok: false, message: `Could not save local trade settings: ${error.message}` });
+  }
   res.json({
     ok: true,
     enabled,
     mode: tradingMode,
     settings,
+    riskReady: missingRiskSettings(settings).length === 0,
+    missingRiskSettings: missingRiskSettings(settings),
     message: !enabled
-      ? 'Manual mode enabled. Choose a signal and preview each entry.'
+      ? `Manual mode enabled. Choose a signal and preview each entry.${liveSubmissionInProgress ? ' A live order was already being submitted; check Dhan for its latest status.' : ''}`
       : tradingMode === 'PAPER'
         ? 'Auto mode enabled. Confirmed signals open simulated Paper positions automatically.'
           : 'Live auto mode enabled. The server checks positions and active orders before each automatic stock-option entry.'

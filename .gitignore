@@ -1,5 +1,6 @@
 node_modules/
 .env
+.env.tmp
 .env.*
 !.env.example
 npm-debug.log*
@@ -7,3 +8,8 @@ npm-debug.log*
 .claude/
 .dhan-auto-state.json
 .dhan-auto-state.json.tmp
+.dhan-local-state.json
+.dhan-local-state.json.tmp
+.dhan-market-safety.json
+.dhan-market-safety.json.tmp
+.dhan-logs/

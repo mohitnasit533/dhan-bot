@@ -6,10 +6,20 @@ function createAutoSignalStore(statePath) {
   const signals = new Map();
   try {
     const savedSignals = JSON.parse(fs.readFileSync(statePath, 'utf8'));
-    for (const [symbol, signalKey] of Object.entries(savedSignals)) {
-      if (typeof signalKey === 'string') signals.set(symbol, signalKey);
+    if (!savedSignals || typeof savedSignals !== 'object' || Array.isArray(savedSignals)) {
+      throw new Error('Saved auto-trade signal state has an invalid format.');
     }
-  } catch {}
+    for (const [symbol, signalKey] of Object.entries(savedSignals)) {
+      if (!/^[A-Z0-9&._-]{1,30}$/.test(symbol) || typeof signalKey !== 'string' || signalKey.length > 100) {
+        throw new Error('Saved auto-trade signal state contains invalid data.');
+      }
+      signals.set(symbol, signalKey);
+    }
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      throw new Error(`Could not safely restore auto-trade duplicate protection: ${error.message}`);
+    }
+  }
 
   function remember(symbol, signalKey) {
     if (signals.get(symbol) === signalKey) return false;
