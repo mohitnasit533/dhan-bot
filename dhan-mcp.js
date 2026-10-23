@@ -6,15 +6,26 @@ const { StreamableHTTPClientTransport } = require('@modelcontextprotocol/sdk/cli
 
 const MCP_URL = 'https://mcp.dhan.co/mcp';
 const MCP_ORIGIN = new URL(MCP_URL).origin;
+const MARKET_QUOTE_ACTIONS = new Set(['ltp', 'ohlc', 'quote']);
+
+function getMarketDataActions(tool) {
+  const schemaActions = tool.inputSchema?.properties?.action?.enum;
+  if (Array.isArray(schemaActions)) return schemaActions;
+  const description = typeof tool.description === 'string' ? tool.description : '';
+  const actions = [];
+  const actionPattern = /^\s*[•*-]\s*(ltp|ohlc|quote|optionchain|expirylist)\s*(?:-|—)/gim;
+  for (const match of description.matchAll(actionPattern)) actions.push(match[1].toLowerCase());
+  return actions;
+}
 
 function summarizeTool(tool) {
   const properties = tool.inputSchema?.properties || {};
   return {
     name: tool.name,
-    description: typeof tool.description === 'string' ? tool.description.slice(0, 500) : '',
+    description: typeof tool.description === 'string' ? tool.description.slice(0, 2000) : '',
     readOnlyHint: tool.annotations?.readOnlyHint === true,
     inputFields: Object.keys(properties),
-    actionOptions: Array.isArray(properties.action?.enum) ? properties.action.enum.slice(0, 30) : [],
+    actionOptions: getMarketDataActions(tool).slice(0, 30),
     payloadFields: Object.keys(properties.payload?.properties || {})
   };
 }
@@ -120,8 +131,12 @@ function createDhanMcp(options = {}) {
     if (!oauthTokens?.access_token) throw new Error('Connect and authorize Dhan MCP first.');
     const tool = tools.find((candidate) => candidate.name === 'market_data_agent_tool');
     if (!tool) throw new Error('Dhan MCP did not expose its market_data_agent_tool.');
-    if (!['get_ltp', 'get_ohlc', 'get_quote'].includes(action)) {
-      throw new Error('Unsupported MCP market-data action. Use get_ltp, get_ohlc, or get_quote.');
+    const actionAliases = { get_ltp: 'ltp', get_ohlc: 'ohlc', get_quote: 'quote' };
+    const advertisedActions = getMarketDataActions(tool);
+    const requestedAction = typeof action === 'string' ? action.toLowerCase() : '';
+    const canonicalAction = actionAliases[requestedAction] || requestedAction;
+    if (!MARKET_QUOTE_ACTIONS.has(canonicalAction) || !advertisedActions.includes(requestedAction) && !advertisedActions.includes(canonicalAction)) {
+      throw new Error('Unsupported MCP market-data action. Use an advertised ltp, ohlc, or quote action.');
     }
     if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
       throw new Error('Market-data payload must be an object.');
@@ -140,11 +155,6 @@ function createDhanMcp(options = {}) {
     }
     if (!Object.keys(payload).length) throw new Error('Market-data payload must include at least one exchange segment.');
 
-    const actionSchema = toolSchema.action || {};
-    const allowedAction = actionSchema.enum;
-    if (!Array.isArray(allowedAction) || !allowedAction.includes(action)) {
-      throw new Error('The connected MCP tool schema does not explicitly allow this market-data action.');
-    }
     for (const key of Object.keys(payload)) {
       if (Object.keys(payloadSchema).length && !(key in payloadSchema)) {
         throw new Error(`The connected MCP tool schema does not allow payload field ${key}.`);
@@ -155,7 +165,8 @@ function createDhanMcp(options = {}) {
     const transport = new TransportConstructor(new URL(url), { authProvider: provider });
     try {
       await client.connect(transport);
-      const result = await client.callTool({ name: tool.name, arguments: { action, payload } });
+      const toolAction = advertisedActions.includes(requestedAction) ? requestedAction : canonicalAction;
+      const result = await client.callTool({ name: tool.name, arguments: { action: toolAction, payload } });
       if (result.isError) throw new Error('Dhan MCP market-data request failed.');
       return result;
     } finally {

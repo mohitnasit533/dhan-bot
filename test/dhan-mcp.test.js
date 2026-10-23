@@ -4,17 +4,21 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { createDhanMcp } = require('../dhan-mcp');
 
-function createFakeMcp() {
+function createFakeMcp({ descriptionOnlyActions = false } = {}) {
   let provider;
   let connected = false;
   const tools = [
     {
       name: 'market_data_agent_tool',
-      description: 'Fetch quotes and OHLC data for requested securities.',
+      description: descriptionOnlyActions
+        ? 'ACTIONS:\n• ltp - Last traded price\n• ohlc - OHLC data\n• quote - Full market quote\n• optionchain - Option chain\n• expirylist - Expiries'
+        : 'Fetch quotes and OHLC data for requested securities.',
       annotations: { readOnlyHint: false },
       inputSchema: {
         properties: {
-          action: { type: 'string', enum: ['get_ltp', 'get_ohlc', 'get_quote'] },
+          action: descriptionOnlyActions
+            ? { type: 'string' }
+            : { type: 'string', enum: ['get_ltp', 'get_ohlc', 'get_quote'] },
           payload: {
             type: 'object',
             properties: {
@@ -134,4 +138,17 @@ test('Dhan MCP completes PKCE callback and lists only annotated read-only market
 
   mcp.disconnect();
   assert.equal(mcp.getStatus().authorized, false);
+});
+
+test('Dhan MCP uses documented action names when the tool schema omits action enums', async () => {
+  const fake = createFakeMcp({ descriptionOnlyActions: true });
+  const mcp = createDhanMcp(fake);
+  const pending = await mcp.connect();
+  const state = new URL(pending.authorizationUrl).searchParams.get('state');
+  const status = await mcp.finishAuthorization(new URLSearchParams(`state=${state}&code=test-code`));
+
+  assert.deepEqual(status.marketDataTools[0].actionOptions, ['ltp', 'ohlc', 'quote', 'optionchain', 'expirylist']);
+  await mcp.callMarketData('get_quote', { NSE_EQ: [11536] });
+  assert.deepEqual(fake.calls[0].arguments, { action: 'quote', payload: { NSE_EQ: [11536] } });
+  await assert.rejects(mcp.callMarketData('optionchain', { UnderlyingScrip: 13 }), /Unsupported MCP market-data action/);
 });
